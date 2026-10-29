@@ -83,7 +83,7 @@ it is why the agent's result is reported as points and table wins rather than as
 ```bash
 git clone https://github.com/ryankkhalil19/microholdem && cd microholdem
 python -m pip install -e ".[dev]"          # builds the C++ extension (needs a C++17 compiler)
-pytest -q                                   # 46 tests, about 20 s, includes the exhaustive 7-card census
+pytest -q                                   # 46 tests, under 10 s, includes the exhaustive 7-card census
 ruff check src tests && mypy               # lint and strict type check
 python -m microholdem.bench --out bench    # full benchmark, about 6 minutes
 python -m microholdem.simulate sng --tables 100 --lineup micro,granite,blitz,sponge,oracle,jammer,scatter,passenger
