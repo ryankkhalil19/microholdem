@@ -1,22 +1,22 @@
 {
   "seed": 20261028,
   "timings_s": {
-    "class_equity": 89.81,
-    "preflop_equity": 26.44,
-    "pushfold_hu": 2.42,
-    "pushfold_multi": 212.42,
-    "river": 7.02
+    "class_equity": 81.95,
+    "preflop_equity": 25.42,
+    "pushfold_hu": 2.46,
+    "pushfold_multi": 200.95,
+    "river": 5.05
   },
   "convergence": {
     "pushfold_hu_max_exploitability_bb": 4.9226046499428744e-05,
     "pushfold_hu_iterations_max": 250,
-    "pushfold_multi_max_residual": 0.005573893726174117,
+    "pushfold_multi_max_br_gain_bb": 1.8636658695162748e-05,
+    "pushfold_multi_max_residual": 0.011510189312454844,
     "river_exploitability_pots": {
       "0.5": 2.1757856135395937e-06,
       "1": 1.8571637083741876e-06,
       "2": 2.104792625828855e-06,
-      "4": 1.1101918765660246e-05,
-      "8": 1.1101918765660246e-05
+      "4": 1.1101918765660246e-05
     }
   },
   "class_equity_samples_per_pair": 40000,

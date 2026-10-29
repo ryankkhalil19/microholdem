@@ -1,4 +1,5 @@
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from microholdem import _core
@@ -14,14 +15,16 @@ from microholdem.pushfold import (
 from microholdem.rivercfr import RiverCFR, build_tree, decision_nodes, solve_river
 from microholdem.tables import tables
 
+EqW = tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]
+
 
 @pytest.fixture(scope="module")
-def eq_and_weights() -> tuple[np.ndarray, np.ndarray]:
+def eq_and_weights() -> EqW:
     tb = tables()
     return tb.class_equity.astype(np.float64), _core.class_pair_weights()
 
 
-def test_headsup_converges_and_matches_known_structure(eq_and_weights: tuple[np.ndarray, np.ndarray]) -> None:
+def test_headsup_converges_and_matches_known_structure(eq_and_weights: EqW) -> None:
     eq, w = eq_and_weights
     aa, s72, k2o, a2o = parse_class("AA"), parse_class("72o"), parse_class("K2o"), parse_class("A2o")
     prev_jam = 2.0
@@ -41,7 +44,7 @@ def test_headsup_converges_and_matches_known_structure(eq_and_weights: tuple[np.
     assert short.jam[k2o] > 0.99 and short.call[a2o] > 0.99
 
 
-def test_exploitability_is_zero_only_at_equilibrium(eq_and_weights: tuple[np.ndarray, np.ndarray]) -> None:
+def test_exploitability_is_zero_only_at_equilibrium(eq_and_weights: EqW) -> None:
     eq, w = eq_and_weights
     P, prior = conditional_deal_matrix(w), class_prior(w)
     sol = solve_headsup(eq, w, 10.0, iterations=1500, tol=1e-4)
@@ -51,7 +54,7 @@ def test_exploitability_is_zero_only_at_equilibrium(eq_and_weights: tuple[np.nda
     assert headsup_exploitability(eq, P, prior, 10.0, sol.jam, sol.call) < 1e-3
 
 
-def test_multiway_first_in_tightens_with_players_behind(eq_and_weights: tuple[np.ndarray, np.ndarray]) -> None:
+def test_multiway_first_in_tightens_with_players_behind(eq_and_weights: EqW) -> None:
     eq, w = eq_and_weights
     fracs = []
     for k in (1, 3, 7):
@@ -88,3 +91,15 @@ def test_river_uniform_strategy_is_exploitable() -> None:
     assert solver.exploitability() > 0.05  # uniform strategies before any iteration
     solver.run(300)
     assert solver.exploitability() < 5e-3
+
+
+def test_multiway_best_response_gain_decreases_and_k1_matches_headsup(eq_and_weights: EqW) -> None:
+    eq, w = eq_and_weights
+    posts, jp = posts_for_first_in(3)
+    gains = [solve_multiway(eq, w, 10.0, posts, jp, iterations=it).br_gain for it in (50, 200, 800)]
+    assert gains[0] > gains[1] > gains[2]
+    assert gains[2] < 1e-4
+    one = solve_multiway(eq, w, 10.0, [1.0], 0.5, iterations=1500)
+    hu = solve_headsup(eq, w, 10.0, iterations=1500, tol=0.0)
+    assert np.abs(one.jam - hu.jam).max() < 0.02
+    assert np.abs(one.calls[0] - hu.call).max() < 0.02

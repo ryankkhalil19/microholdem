@@ -46,3 +46,10 @@ def test_class_range_helpers() -> None:
     assert found is not None
     acts, strat = found
     assert "f" in acts and strat.shape == (tb.river_buckets, len(acts))
+
+
+def test_multiway_tables_report_a_best_response_gain() -> None:
+    tb = tables()
+    assert tb.meta["convergence"]["pushfold_multi_max_br_gain_bb"] < 1e-4
+    assert float(np.nanmax(tb.multi_br_gain[1:])) < 1e-4
+    assert len(RIVER_STACKS) == 4 and max(RIVER_STACKS) == 4.0

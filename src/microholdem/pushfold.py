@@ -8,8 +8,12 @@ Multiway first-in
     A first-in player with ``k`` opponents behind jams or folds; each player
     behind calls or folds. Opponents are assumed to act independently and at
     most one call is resolved ("no overcall" model, the standard push/fold
-    chart assumption). This is a general-sum approximation, so convergence is
-    reported as the residual strategy change rather than exploitability.
+    chart assumption); each caller conditions on the hand having reached it,
+    that is on the jam and on every earlier player folding. This is a
+    general-sum approximation, so convergence is reported as the largest
+    best-response gain of any player under the model's own value functions
+    (``br_gain``, BB per hand), with the last-iteration strategy change kept
+    as a diagnostic (``residual``).
 
 Units: all chips are in big blinds. ``stack`` is the effective stack at the
 start of the hand and includes anything a player posts. Payoffs are the
@@ -131,7 +135,8 @@ class MultiwaySolution:
     jam: F64  # P(jam | class) for the first-in player
     calls: F64  # shape (n_behind, 169): P(call | class) for each player behind, in order
     ev_jam: F64  # chip EV of jamming per class (BB)
-    residual: float  # max absolute strategy change over the last iteration
+    residual: float  # max absolute change of the current strategies over the last iteration (diagnostic)
+    br_gain: float  # largest best-response gain of any player against the average strategies, BB per hand
     iterations: int
 
 
@@ -154,13 +159,27 @@ def multiway_values(
         C_i = (P * calls[i][None, :]).sum(axis=1)  # P(i calls | a)
         V_i = (P * calls[i][None, :] * showdown_jammer).sum(axis=1)
         u_jam += survive * V_i
-        survive = survive * (1.0 - C_i)
-        reach = P * jam[None, :]  # (b, a): P(a | b) * jam[a]
+        # Caller i is reached only if the jammer jams and every earlier player folds.
+        reach = P * (jam * survive)[None, :]  # (b, a): P(a | b) * jam[a] * P(earlier callers fold | a)
         showdown_caller = eq * pot - S  # (b, a): caller net with b vs jammer a
         u_call[i] = (reach * showdown_caller).sum(axis=1)
         u_fold[i] = (reach * (-posts_behind[i])).sum(axis=1)
+        survive = survive * (1.0 - C_i)
     u_jam += survive * W_all
     return u_jam, u_call, u_fold
+
+
+def multiway_br_gain(
+    eq: F64, P: F64, prior: F64, stack: float, posts_behind: list[float], jammer_post: float, jam: F64, calls: F64
+) -> float:
+    """Largest best-response gain of any player against ``(jam, calls)`` under the model (BB per hand)."""
+    u_jam, u_call, u_fold = multiway_values(eq, P, stack, posts_behind, jam, calls)
+    u_fold_j = np.full_like(u_jam, -jammer_post)
+    gain = float((prior * (np.maximum(u_jam, u_fold_j) - (jam * u_jam + (1.0 - jam) * u_fold_j))).sum())
+    for i in range(len(posts_behind)):
+        cur = calls[i] * u_call[i] + (1.0 - calls[i]) * u_fold[i]
+        gain = max(gain, float((prior * (np.maximum(u_call[i], u_fold[i]) - cur)).sum()))
+    return gain
 
 
 def solve_multiway(
@@ -205,8 +224,16 @@ def solve_multiway(
     jam_avg = jam_sum / wsum
     calls_avg = call_sum / wsum
     u_jam, _, _ = multiway_values(eq, P, stack, posts_behind, jam_avg, calls_avg)
+    gain = multiway_br_gain(eq, P, class_prior(weights), stack, posts_behind, jammer_post, jam_avg, calls_avg)
     return MultiwaySolution(
-        stack=stack, n_behind=k, jam=jam_avg, calls=calls_avg, ev_jam=u_jam, residual=residual, iterations=iterations
+        stack=stack,
+        n_behind=k,
+        jam=jam_avg,
+        calls=calls_avg,
+        ev_jam=u_jam,
+        residual=residual,
+        br_gain=gain,
+        iterations=iterations,
     )
 
 

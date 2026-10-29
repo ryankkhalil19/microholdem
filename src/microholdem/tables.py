@@ -39,7 +39,9 @@ F64 = npt.NDArray[np.float64]
 HU_STACKS: tuple[float, ...] = tuple(float(x) / 2.0 for x in range(2, 51))  # 1.0 .. 25.0 step 0.5
 MULTI_STACKS: tuple[float, ...] = tuple(float(x) for x in range(2, 26))  # 2 .. 25 step 1
 MAX_BEHIND = 7
-RIVER_STACKS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+# With bet sizes of 0.5 and 1 pot and one raise to 3x, the river tree commits at most 3 pots, so
+# every stack of 3 pots or more is the same game; 4 is the deepest grid point for that reason.
+RIVER_STACKS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 RIVER_BUCKETS = 10
 
 
@@ -107,6 +109,7 @@ def build_tables(
     mjam = np.zeros((MAX_BEHIND + 1, len(MULTI_STACKS), N_CLASSES), dtype=np.float32)
     mcall = np.zeros((MAX_BEHIND + 1, len(MULTI_STACKS), MAX_BEHIND, N_CLASSES), dtype=np.float32)
     mresid = np.zeros((MAX_BEHIND + 1, len(MULTI_STACKS)))
+    mgain = np.zeros((MAX_BEHIND + 1, len(MULTI_STACKS)))
     for k in range(1, MAX_BEHIND + 1):
         posts, jpost = posts_for_first_in(k)
         for i, s in enumerate(MULTI_STACKS):
@@ -114,11 +117,21 @@ def build_tables(
             mjam[k, i] = m_sol.jam
             mcall[k, i, :k] = m_sol.calls
             mresid[k, i] = m_sol.residual
-    np.savez(out / "pushfold_multi.npz", stacks=np.asarray(MULTI_STACKS), jam=mjam, call=mcall, residual=mresid)
+            mgain[k, i] = m_sol.br_gain
+    np.savez(
+        out / "pushfold_multi.npz",
+        stacks=np.asarray(MULTI_STACKS),
+        jam=mjam,
+        call=mcall,
+        residual=mresid,
+        br_gain=mgain,
+    )
     meta["timings_s"]["pushfold_multi"] = round(time.perf_counter() - t0, 2)
+    meta["convergence"]["pushfold_multi_max_br_gain_bb"] = float(np.max(mgain[1:]))
     meta["convergence"]["pushfold_multi_max_residual"] = float(np.max(mresid[1:]))
     print(
-        f"multiway push/fold: {meta['timings_s']['pushfold_multi']} s, max residual {np.max(mresid[1:]):.2e}",
+        f"multiway push/fold: {meta['timings_s']['pushfold_multi']} s, max best-response gain "
+        f"{np.max(mgain[1:]):.2e} BB/hand, max residual {np.max(mresid[1:]):.2e}",
         file=sys.stderr,
     )
 
@@ -159,6 +172,10 @@ class Tables:
         self._multi_grid: list[float] = [float(x) for x in self.multi_stacks]
         self.multi_jam: F32 = multi["jam"]
         self.multi_call: F32 = multi["call"]
+        if "br_gain" in multi.files:
+            self.multi_br_gain: F64 = multi["br_gain"]
+        else:
+            self.multi_br_gain = np.full(multi["jam"].shape[:2], np.nan)
         river = np.load(self.root / "river.npz", allow_pickle=False)
         self.river_stacks: F64 = river["stacks"]
         self._river_grid: list[float] = [float(x) for x in self.river_stacks]
