@@ -16,8 +16,9 @@ Python 3.10+, numpy, pybind11 (build only). MIT license. CI runs ruff, mypy
 Apple M1, macOS, Python 3.10.13, single core. Produced by `python -m microholdem.bench --out bench`;
 the raw numbers are in `bench/results.json` and `bench/results.md`.
 
-Per-action latency of the agent, measured by the engine around every `act()` call
-with `perf_counter_ns`, including observation construction on the agent side:
+Per-action latency of the agent, measured by the engine with `perf_counter_ns` around every `act()` call
+(the engine builds the observation before the timer starts; everything the agent does, including its own
+range inference and the C++ equity call, is inside the timed region):
 
 | Agent per-action latency | actions | p50 | p90 | p99 | p99.9 | max |
 |---|---:|---:|---:|---:|---:|---:|
