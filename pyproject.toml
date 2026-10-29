@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "pybind11>=2.12", "numpy>=1.24"]
+requires = ["setuptools>=77", "pybind11>=2.12", "numpy>=1.24"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,13 @@ version = "0.1.0"
 description = "Sub-millisecond No-Limit Hold'em decision engine: C++ evaluator, Monte Carlo equity, ICM, CFR solvers, tournament simulator, latency harness."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Ryan Khalil" }]
 dependencies = ["numpy>=1.24"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: C++",
-    "License :: OSI Approved :: MIT License",
     "Topic :: Games/Entertainment",
 ]
 
@@ -45,7 +45,7 @@ python_version = "3.10"
 strict = true
 warn_unused_ignores = true
 mypy_path = "src"
-packages = ["microholdem"]
+files = ["src/microholdem", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["microholdem._core"]
@@ -54,7 +54,7 @@ ignore_missing_imports = true
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-src = ["src", "tests", "scripts"]
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "N", "RUF"]
