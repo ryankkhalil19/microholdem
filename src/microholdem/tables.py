@@ -96,10 +96,10 @@ def build_tables(
         iterations=iters,
     )
     meta["timings_s"]["pushfold_hu"] = round(time.perf_counter() - t0, 2)
-    meta["convergence"]["pushfold_hu_max_exploitability_bb"] = float(expl.max())
-    meta["convergence"]["pushfold_hu_iterations_max"] = int(iters.max())
+    meta["convergence"]["pushfold_hu_max_exploitability_bb"] = float(np.max(expl))
+    meta["convergence"]["pushfold_hu_iterations_max"] = int(np.max(iters))
     print(
-        f"heads-up push/fold: {meta['timings_s']['pushfold_hu']} s, max exploitability {expl.max():.2e} BB/hand",
+        f"heads-up push/fold: {meta['timings_s']['pushfold_hu']} s, max exploitability {np.max(expl):.2e} BB/hand",
         file=sys.stderr,
     )
 
@@ -116,9 +116,9 @@ def build_tables(
             mresid[k, i] = m_sol.residual
     np.savez(out / "pushfold_multi.npz", stacks=np.asarray(MULTI_STACKS), jam=mjam, call=mcall, residual=mresid)
     meta["timings_s"]["pushfold_multi"] = round(time.perf_counter() - t0, 2)
-    meta["convergence"]["pushfold_multi_max_residual"] = float(mresid[1:].max())
+    meta["convergence"]["pushfold_multi_max_residual"] = float(np.max(mresid[1:]))
     print(
-        f"multiway push/fold: {meta['timings_s']['pushfold_multi']} s, max residual {mresid[1:].max():.2e}",
+        f"multiway push/fold: {meta['timings_s']['pushfold_multi']} s, max residual {np.max(mresid[1:]):.2e}",
         file=sys.stderr,
     )
 
