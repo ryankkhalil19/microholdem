@@ -90,3 +90,24 @@ def test_five_card_census() -> None:
 @pytest.mark.slow
 def test_seven_card_census_exhaustive() -> None:
     assert list(_core.category_census7()) == CENSUS7
+
+
+def test_positional_mask_and_batch_entry_points_validate_input() -> None:
+    cards = parse_cards("Ah Kd Qc Js Td 2c 3d")
+    assert _core.evaluate7(*cards) == evaluate(cards)
+    assert _core.evaluate7(a=cards[0], b=cards[1], c=cards[2], d=cards[3], e=cards[4], f=cards[5], g=cards[6]) == (
+        evaluate(cards)
+    )
+    assert _core.evaluate_mask(_core.card_mask(cards)) == evaluate(cards)
+    assert _core.evaluate_mask(_core.card_mask(cards[:5])) == evaluate(cards[:5])
+    with pytest.raises(ValueError):
+        _core.evaluate7(cards[0], cards[0], *cards[2:])
+    with pytest.raises(ValueError):
+        _core.evaluate7(52, *cards[1:])
+    with pytest.raises(ValueError):
+        _core.evaluate_mask(_core.card_mask(cards[:4]))
+    with pytest.raises(ValueError):
+        _core.evaluate_mask(1 << 13)  # a bit outside the four 13-bit rank lanes
+    for row in ([0, 0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5, 52], [0, 1, 2, 3, 4, 5, -1]):
+        with pytest.raises(ValueError):
+            evaluate_batch(np.asarray([row], dtype=np.int32))

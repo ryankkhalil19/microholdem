@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from microholdem import _core
-from microholdem.cards import class_combo_count, parse_cards, parse_class
+from microholdem.cards import class_combo_count, class_combos, parse_cards, parse_class
 from microholdem.equity import Range, equity_known, equity_vs_random, equity_vs_ranges, exact_equity_hu
 from microholdem.evaluator import evaluate
 
@@ -100,3 +100,71 @@ def test_class_tables_consistency() -> None:
     assert eq[s72, aa] < 0.16
     vs_random = _core.class_equity_vs_random(1, 3000, 4)
     assert vs_random[aa] > vs_random[kk] > vs_random[s72]
+
+
+def _exact_vs_two_ranges(hero: list[int], board: list[int], r1: Range, r2: Range) -> float:
+    """Weighted enumeration over all consistent (combo1, combo2) deals on a river board."""
+    known = set(hero) | set(board)
+    hv = evaluate([*hero, *board])
+
+    def combos(r: Range) -> list[tuple[int, int, float]]:
+        out = []
+        for idx in np.flatnonzero(r.weights > 0):
+            for a, b in class_combos(int(idx)):
+                if a not in known and b not in known:
+                    out.append((a, b, float(r.weights[idx])))
+        return out
+
+    num = den = 0.0
+    for a, b, w1 in combos(r1):
+        v1 = evaluate([a, b, *board])
+        for c, d, w2 in combos(r2):
+            if c in (a, b) or d in (a, b):
+                continue
+            v2 = evaluate([c, d, *board])
+            w = w1 * w2
+            den += w
+            best = max(v1, v2)
+            if hv > best:
+                num += w
+            elif hv == best:
+                num += w / (1 + (v1 == hv) + (v2 == hv))
+    return num / den
+
+
+def test_two_overlapping_ranges_follow_the_joint_distribution_and_ignore_order() -> None:
+    hero, board = parse_cards("8s Kh"), parse_cards("4c Kd 7c 3c 3d")
+    tight, wide = Range.parse("JJ+, AKs, AKo"), Range.parse("77+, A9s+, KQs, AJo+")
+    exact = _exact_vs_two_ranges(hero, board, tight, wide)
+    n = 400_000
+    se = math.sqrt(exact * (1 - exact) / n)
+    a = equity_vs_ranges(hero, board, [tight, wide], n, seed=11)
+    b = equity_vs_ranges(hero, board, [wide, tight], n, seed=12)
+    assert abs(a - exact) < 4 * se
+    assert abs(b - exact) < 4 * se
+
+
+def test_ranges_with_few_consistent_deals_still_evaluate() -> None:
+    hero, board = parse_cards("Ah Ad"), parse_cards("Kc 7d 2h 9s 3c")
+    eq = equity_vs_ranges(hero, board, [Range.parse("AA, KK"), Range.parse("AA")], 2000, seed=1)
+    assert eq == 0.0  # the only consistent deals give the first opponent kings full of... trips kings
+    with pytest.raises(ValueError):
+        equity_vs_ranges(hero, parse_cards("Ac 7d 2h 9s 3c"), [Range.parse("AA")], 10, seed=1)  # no combo left
+
+
+def test_range_runs_with_a_fixed_high_card() -> None:
+    assert Range.parse("A5s-A2s").weights.sum() == 4
+    assert Range.parse("KQo-KTo").weights.sum() == 3
+    assert Range.parse("QQ-99").weights.sum() == 4
+    assert Range.parse("98o-54o").weights.sum() == 5
+    with pytest.raises(ValueError):
+        Range.parse("A5s-K2s")
+
+
+def test_shipped_class_equity_matches_exact_values() -> None:
+    from microholdem.tables import tables
+
+    eq = tables().class_equity
+    exact = {("AA", "KK"): 0.81946, ("72o", "AA"): 0.11800, ("AKs", "22"): 0.49893, ("KQs", "KJo"): 0.74961}
+    for (a, b), value in exact.items():  # 40,000 deals per pair: standard error about 0.0025
+        assert abs(float(eq[parse_class(a), parse_class(b)]) - value) < 0.0125, (a, b)

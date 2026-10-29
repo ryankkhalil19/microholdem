@@ -220,10 +220,13 @@ struct WeightedRange {
     std::vector<int> c1, c2;
     std::vector<double> cum;  // cumulative weights, last == total
     double total = 0.0;
+    std::array<double, 52> card_mass{};  // total weight of the combos that contain each card
+    std::vector<double> pair_w;          // 52 x 52 symmetric table: weight of the combo (c, d), 0 if absent
     inline int sample(Rng& rng) const {
         const double u = rng.unit() * total;
         return static_cast<int>(std::lower_bound(cum.begin(), cum.end(), u) - cum.begin());
     }
+    inline double pair(int c, int d) const { return pair_w[c * 52 + d]; }
 };
 
 WeightedRange make_range(const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& combos,
@@ -231,6 +234,7 @@ WeightedRange make_range(const py::array_t<int32_t, py::array::c_style | py::arr
     if (combos.ndim() != 2 || combos.shape(1) != 2) throw std::invalid_argument("combos must have shape (M, 2)");
     if (weights.ndim() != 1 || weights.shape(0) != combos.shape(0)) throw std::invalid_argument("weights must have shape (M,)");
     WeightedRange r;
+    r.pair_w.assign(52 * 52, 0.0);
     const auto cb = combos.unchecked<2>();
     const auto wb = weights.unchecked<1>();
     double acc = 0.0;
@@ -243,6 +247,10 @@ WeightedRange make_range(const py::array_t<int32_t, py::array::c_style | py::arr
         r.c1.push_back(a);
         r.c2.push_back(b);
         r.cum.push_back(acc);
+        r.card_mass[a] += w;
+        r.card_mass[b] += w;
+        r.pair_w[a * 52 + b] += w;
+        r.pair_w[b * 52 + a] += w;
     }
     if (acc <= 0.0) throw std::invalid_argument("range has zero total weight");
     r.total = acc;
@@ -250,8 +258,19 @@ WeightedRange make_range(const py::array_t<int32_t, py::array::c_style | py::arr
 }
 
 // Hero equity against one or more opponents who each hold a weighted range.
-// Combos that collide with known cards or other sampled opponents are
-// rejected and redrawn, so the sample is uniform over consistent deals.
+//
+// Target distribution: a deal (one combo per opponent, no card shared with the
+// known cards or another opponent) has probability proportional to the product
+// of the combo weights. Opponents are drawn one at a time, each by rejection
+// against the cards already out, which is cheap but is a different (sequential)
+// distribution whenever overlapping ranges block each other unevenly. Each deal
+// is therefore weighted by the product, over opponents, of the mass of the
+// opponent's range still available when it was drawn (the exact ratio of the
+// target to the proposal up to a constant), and the weighted average converges
+// to the target equity independently of the opponent order. Heads-up the
+// weights are constant and the estimate is a plain average. Proposals in which
+// an opponent is left with less than 1e-6 of its mass are discarded (their
+// weight is negligible) so no draw can spin.
 double equity_vs_ranges(const std::vector<int>& hero, const std::vector<int>& board,
                         const std::vector<WeightedRange>& ranges, int n_samples, uint64_t seed) {
     if (hero.size() != 2) throw std::invalid_argument("hero must hold exactly two cards");
@@ -263,23 +282,72 @@ double equity_vs_ranges(const std::vector<int>& hero, const std::vector<int>& bo
     if (hm & bm) throw std::invalid_argument("hero and board share a card");
     const uint64_t known = hm | bm;
     const int n_opp = static_cast<int>(ranges.size());
+    int known_cards[7];
+    int n_known = 0;
+    for (int c = 0; c < 52; ++c)
+        if (known & card_bit(c)) known_cards[n_known++] = c;
+    // Per opponent: the mass of its range that avoids the known cards, and per card the mass of
+    // the combos containing that card which avoid the known cards (inclusion-exclusion inputs).
+    std::vector<double> avail_known(n_opp);
+    std::vector<std::array<double, 52>> mass_free(n_opp);
+    for (int o = 0; o < n_opp; ++o) {
+        const WeightedRange& r = ranges[o];
+        double a = r.total;
+        for (int i = 0; i < n_known; ++i) a -= r.card_mass[known_cards[i]];
+        for (int i = 0; i < n_known; ++i)
+            for (int j = i + 1; j < n_known; ++j) a += r.pair(known_cards[i], known_cards[j]);
+        if (a <= 1e-9 * r.total) throw std::invalid_argument("a range has no combo consistent with the known cards");
+        avail_known[o] = a;
+        if (n_opp > 1) {
+            for (int c = 0; c < 52; ++c) {
+                double mc = r.card_mass[c];
+                for (int i = 0; i < n_known; ++i) mc -= r.pair(c, known_cards[i]);
+                mass_free[o][c] = mc;
+            }
+        }
+    }
     Rng rng(seed);
     const int need = 5 - static_cast<int>(board.size());
     Deck deck;
     std::array<uint64_t, 9> om{};
-    double total = 0.0;
+    int drawn[18];
+    double total = 0.0, total_w = 0.0;
+    int failures = 0;
     for (int s = 0; s < n_samples; ++s) {
         uint64_t used = known;
-        for (int o = 0; o < n_opp; ++o) {
+        double w = 1.0;
+        int nd = 0;
+        bool ok = true;
+        for (int o = 0; o < n_opp && ok; ++o) {
             const WeightedRange& r = ranges[o];
+            if (o > 0) {
+                double a = avail_known[o];
+                for (int i = 0; i < nd; ++i) a -= mass_free[o][drawn[i]];
+                for (int i = 0; i < nd; ++i)
+                    for (int j = i + 1; j < nd; ++j) a += r.pair(drawn[i], drawn[j]);
+                if (a <= 1e-6 * avail_known[o]) { ok = false; break; }
+                w *= a / avail_known[o];
+            }
             int tries = 0;
             while (true) {
                 const int idx = r.sample(rng);
                 const uint64_t m = card_bit(r.c1[idx]) | card_bit(r.c2[idx]);
-                if (!(m & used)) { om[o] = m; used |= m; break; }
-                if (++tries > 10000) throw std::runtime_error("range is blocked by known cards");
+                if (!(m & used)) {
+                    om[o] = m;
+                    used |= m;
+                    drawn[nd++] = r.c1[idx];
+                    drawn[nd++] = r.c2[idx];
+                    break;
+                }
+                if (++tries > 100000) { ok = false; break; }
             }
         }
+        if (!ok) {
+            if (++failures > 100000) throw std::runtime_error("no deal is consistent with the ranges and the known cards");
+            --s;  // discarded proposal (weight zero); draw another
+            continue;
+        }
+        failures = 0;
         deck.build(used);
         deck.draw(need, rng);
         uint64_t b = bm;
@@ -292,9 +360,10 @@ double equity_vs_ranges(const std::vector<int>& hero, const std::vector<int>& bo
             if (ov > hv) { beaten = true; break; }
             if (ov == hv) ++tied;
         }
-        if (!beaten) total += 1.0 / (1.0 + tied);
+        total_w += w;
+        if (!beaten) total += w / (1.0 + tied);
     }
-    return total / n_samples;
+    return total / total_w;
 }
 
 // Exact heads-up equity by enumerating every board completion.
@@ -547,7 +616,7 @@ std::vector<double> icm_equity(const std::vector<double>& stacks, const std::vec
         if (fm == 0.0) continue;
         const int k = __builtin_popcountll(static_cast<unsigned long long>(mask));
         if (k >= places) continue;
-        const double rem = total - sum[mask];
+        const double rem = sum[(m - 1) ^ mask];  // complement subset sum: no cancellation for lopsided stacks
         if (rem <= 0.0) continue;
         const double pay = payouts[k];
         for (int i = 0; i < n; ++i) {
@@ -602,7 +671,14 @@ uint32_t evaluate_cards(const std::vector<int>& cards) {
 }
 
 uint32_t evaluate7(int a, int b, int c, int d, int e, int f, int g) {
-    return evaluate_mask(card_bit(a) | card_bit(b) | card_bit(c) | card_bit(d) | card_bit(e) | card_bit(f) | card_bit(g));
+    return evaluate_mask(mask_of(std::vector<int>{a, b, c, d, e, f, g}, "evaluate7"));
+}
+
+uint32_t evaluate_mask_checked(uint64_t mask) {
+    constexpr uint64_t VALID = 0x1FFF1FFF1FFF1FFFULL;  // 13 rank bits in each of the four suit lanes
+    const int n = __builtin_popcountll(static_cast<unsigned long long>(mask));
+    if ((mask & ~VALID) || n < 5 || n > 7) throw std::invalid_argument("evaluate_mask needs a mask of 5 to 7 cards");
+    return evaluate_mask(mask);
 }
 
 py::array_t<uint32_t> evaluate_batch(const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& hands) {
@@ -616,7 +692,14 @@ py::array_t<uint32_t> evaluate_batch(const py::array_t<int32_t, py::array::c_sty
         py::gil_scoped_release release;
         for (py::ssize_t i = 0; i < n; ++i) {
             uint64_t m = 0;
-            for (py::ssize_t j = 0; j < k; ++j) m |= card_bit(h(i, j));
+            for (py::ssize_t j = 0; j < k; ++j) {
+                const int c = h(i, j);
+                if (c < 0 || c > 51)
+                    throw std::invalid_argument("evaluate_batch: card out of range in row " + std::to_string(i));
+                const uint64_t b = card_bit(c);
+                if (m & b) throw std::invalid_argument("evaluate_batch: duplicate card in row " + std::to_string(i));
+                m |= b;
+            }
             o(i) = evaluate_mask(m);
         }
     }
@@ -646,8 +729,9 @@ PYBIND11_MODULE(_core, m) {
     m.doc() = "microholdem C++ core: evaluator, Monte Carlo equity, ICM";
     m.attr("CAT_SHIFT") = CAT_SHIFT;
     m.def("evaluate", &evaluate_cards, py::arg("cards"), "Evaluate 5 to 7 cards (list of ints 0..51).");
-    m.def("evaluate7", &evaluate7, "Evaluate seven cards given positionally.");
-    m.def("evaluate_mask", [](uint64_t mask) { return evaluate_mask(mask); }, py::arg("mask"));
+    m.def("evaluate7", &evaluate7, py::arg("a"), py::arg("b"), py::arg("c"), py::arg("d"), py::arg("e"), py::arg("f"),
+          py::arg("g"), "Evaluate seven distinct cards given positionally.");
+    m.def("evaluate_mask", &evaluate_mask_checked, py::arg("mask"), "Evaluate a 64-bit card mask holding 5 to 7 cards.");
     m.def("evaluate_batch", &evaluate_batch, py::arg("hands"), "Evaluate an (N, k) int32 array of hands.");
     m.def("evaluate_random7", &evaluate_random7, py::arg("n"), py::arg("seed"));
     m.def("card_mask", [](const std::vector<int>& cards) { return mask_of(cards, "cards"); }, py::arg("cards"));
@@ -678,7 +762,13 @@ PYBIND11_MODULE(_core, m) {
            int n_samples, uint64_t seed) { return equity_vs_ranges(hero, board, ranges, n_samples, seed); },
         py::arg("hero"), py::arg("board"), py::arg("ranges"), py::arg("n_samples"), py::arg("seed"),
         "Equity against pre-compiled ranges (no per-call range parsing).");
-    m.def("enumerate_equity_hu", &enumerate_equity_hu, py::arg("hero"), py::arg("villain"), py::arg("board"));
+    m.def(
+        "enumerate_equity_hu",
+        [](const std::vector<int>& hero, const std::vector<int>& villain, const std::vector<int>& board) {
+            const auto r = enumerate_equity_hu(hero, villain, board);
+            return py::make_tuple(r[0], r[1], r[2]);
+        },
+        py::arg("hero"), py::arg("villain"), py::arg("board"), "Exact (win, tie, lose) counts over all board completions.");
     m.def("equity_known_hands", &equity_known_hands, py::arg("hands"), py::arg("board"), py::arg("n_samples"),
           py::arg("seed"));
     m.def("class_index", &class_index, py::arg("c1"), py::arg("c2"));

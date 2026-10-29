@@ -36,8 +36,9 @@ class Range:
         """Parse a compact range string such as ``"22+, A2s+, KTo+, QJs"``.
 
         Supported tokens: ``AA``, ``77+`` (pairs and up), ``AKs``, ``A5s+``
-        (suited, kicker and up), ``KTo+``, ``T9s-65s`` (connected run) and
-        a bare class. Whitespace and commas separate tokens.
+        (suited, kicker and up), ``KTo+``, ``QQ-99`` (pair run), ``T9s-65s``
+        (run with a fixed gap), ``A5s-A2s`` or ``KQo-KTo`` (run with a fixed
+        high card) and a bare class. Whitespace and commas separate tokens.
         """
         w = np.zeros(N_CLASSES, dtype=np.float64)
         for tok in text.replace(",", " ").split():
@@ -101,11 +102,16 @@ def _expand_token(tok: str) -> list[int]:
         ia, ib = parse_class(a), parse_class(b)
         ra, ca = divmod(ia, 13)
         rb, cb = divmod(ib, 13)
-        if (ra - ca) != (rb - cb):
-            raise ValueError(f"range run must keep the same gap: {tok!r}")
-        lo, hi = min(ra, rb), max(ra, rb)
-        gap = ra - ca
-        return [(r * 13 + (r - gap)) for r in range(lo, hi + 1)]
+        if (ra - ca) == (rb - cb):  # same gap (or both pairs): T9s-65s, 98o-54o, QQ-99
+            lo, hi = min(ra, rb), max(ra, rb)
+            gap = ra - ca
+            return [(r * 13 + (r - gap)) for r in range(lo, hi + 1)]
+        suited_a, suited_b = ra > ca, rb > cb
+        hi_a, hi_b = max(ra, ca), max(rb, cb)
+        if suited_a == suited_b and hi_a == hi_b and ra != ca and rb != cb:  # same high card: A5s-A2s, KQo-KTo
+            lo, hi = min(min(ra, ca), min(rb, cb)), max(min(ra, ca), min(rb, cb))
+            return [(hi_a * 13 + k) if suited_a else (k * 13 + hi_a) for k in range(lo, hi + 1)]
+        raise ValueError(f"range run must keep the same gap or the same high card: {tok!r}")
     idx = parse_class(t)
     if not plus:
         return [idx]
