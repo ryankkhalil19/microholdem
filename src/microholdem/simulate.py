@@ -3,6 +3,8 @@
 The sit-and-go follows the published competition format: eight bots, 2,000
 starting chips, blinds from 10/20 rising every 25 hands, a 200-hand cap, and
 unfilled places paid out by ICM over the survivors' stacks at the cap. The
+button follows the dead-button rule (the big blind advances one live seat per
+hand; a busted seat can hold the button or the small blind for one hand). The
 duel mode mirrors the heads-up exhibit: stacks reset every hand, so the
 result is a clean chips-per-hand measurement.
 """
@@ -14,6 +16,7 @@ import json
 import random
 import statistics
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,7 +67,7 @@ def blinds_for_hand(cfg: SngConfig, hand_index: int) -> tuple[int, int, int]:
     return cfg.levels[level]
 
 
-def run_sng(bots: list[Bot], seed: int, cfg: SngConfig | None = None) -> SngResult:
+def run_sng(bots: Sequence[Bot], seed: int, cfg: SngConfig | None = None) -> SngResult:
     cfg = cfg or SngConfig()
     n = len(bots)
     if n < 2:
@@ -76,15 +79,16 @@ def run_sng(bots: list[Bot], seed: int, cfg: SngConfig | None = None) -> SngResu
         b.reset(i, n, rng.getrandbits(32))
     finish = [0] * n
     eliminated: list[int] = []
+    alive = [True] * n
     button = rng.randrange(n)
+    sb_pos = next_live(button, alive) if n > 2 else button
+    bb_seat = next_live(sb_pos, alive)
     hands = 0
     history: list[HandResult] = []
     payouts = tuple(cfg.points)
     while hands < cfg.hands_cap and sum(1 for s in stacks if s > 0) > 1:
         sb, bb, ante = blinds_for_hand(cfg, hands)
         alive = [s > 0 for s in stacks]
-        if not alive[button]:
-            button = next_live(button, alive)
         live_payouts = payouts[: sum(alive)]
         hc = HandConfig(
             small_blind=sb,
@@ -94,7 +98,9 @@ def run_sng(bots: list[Bot], seed: int, cfg: SngConfig | None = None) -> SngResu
             payouts=live_payouts,
             record_latency=cfg.record_latency,
         )
-        result = play_hand(bots, stacks, button, hc, rng, hands, stats)
+        result = play_hand(
+            bots, stacks, button, hc, rng, hands, stats, sb_seat=sb_pos if alive[sb_pos] else None, bb_seat=bb_seat
+        )
         hands += 1
         if cfg.record_hands:
             history.append(result)
@@ -102,7 +108,15 @@ def run_sng(bots: list[Bot], seed: int, cfg: SngConfig | None = None) -> SngResu
         # Larger starting stack finishes higher when several bust on the same hand.
         busted.sort(key=lambda i: result.start_stacks[i])
         eliminated.extend(busted)
-        button = next_live(button, [s > 0 for s in stacks])
+        alive = [s > 0 for s in stacks]
+        if sum(alive) > 2:
+            # Dead button (TDA Rule 34): the big blind advances one live seat; the small blind is
+            # the previous big blind seat (dead if it busted); the button is the previous small
+            # blind seat, alive or not.
+            button, sb_pos, bb_seat = sb_pos, bb_seat, next_live(bb_seat, alive)
+        elif sum(alive) == 2:
+            bb_seat = next_live(bb_seat, alive)
+            button = sb_pos = next_live(bb_seat, alive)
     survivors = [i for i in range(n) if stacks[i] > 0]
     places_left = len(survivors)
     points = [0.0] * n
@@ -172,7 +186,7 @@ def run_duel(
 
 
 def run_ring(
-    bots: list[Bot],
+    bots: Sequence[Bot],
     hands: int,
     seed: int,
     stack: int = 10_000,

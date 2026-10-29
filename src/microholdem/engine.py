@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Protocol
@@ -91,7 +92,7 @@ class Observation:
     ante: int
     n_in_hand: int
     hand_number: int
-    history: tuple[tuple[int, int, int, int], ...]  # (street, seat, kind, amount)
+    history: tuple[tuple[int, int, int, int], ...]  # (street, seat, kind, amount); see ActionRecord.amount
     payouts: tuple[float, ...]  # tournament payout structure for ICM, empty if none
 
     @property
@@ -126,6 +127,8 @@ class Bot(Protocol):
 
 @dataclass(slots=True)
 class ActionRecord:
+    """One legalized action. ``amount`` is the raise-to total for raises, the chips put in for calls, else 0."""
+
     street: int
     seat: int
     kind: int
@@ -146,6 +149,8 @@ class HandResult:
     actions: list[ActionRecord]
     showdown: bool
     winners: list[int]
+    sb_seat: int | None = None  # None when the small blind was dead
+    bb_seat: int = -1
 
     @property
     def net(self) -> list[int]:
@@ -183,22 +188,35 @@ def next_live(seat: int, alive: list[bool]) -> int:
 
 
 def play_hand(
-    bots: list[Bot],
+    bots: Sequence[Bot],
     stacks: list[int],
     button: int,
     cfg: HandConfig,
     rng: random.Random,
     hand_number: int,
     stats: list[BotStats] | None = None,
+    *,
+    sb_seat: int | None = None,
+    bb_seat: int | None = None,
 ) -> HandResult:
-    """Play one hand in place (``stacks`` is updated) and return the record."""
+    """Play one hand in place (``stacks`` is updated) and return the record.
+
+    By default the blinds are derived from ``button``, which must be a live seat. Tournament
+    callers may pass ``bb_seat`` (and ``sb_seat``) explicitly for the dead-button rule: the button
+    may then sit on a busted seat and ``sb_seat`` may be ``None`` when the small blind is dead.
+    """
     n = len(stacks)
     alive = [s > 0 for s in stacks]
     players = [i for i in range(n) if alive[i]]
     if len(players) < 2:
         raise ValueError("a hand needs at least two players with chips")
-    if not alive[button]:
-        raise ValueError("button must be on a live seat")
+    if not 0 <= button < n:
+        raise ValueError("button out of range")
+    if bb_seat is None:
+        if not alive[button]:
+            raise ValueError("button must be on a live seat")
+    elif not alive[bb_seat] or (sb_seat is not None and not alive[sb_seat]) or sb_seat == bb_seat:
+        raise ValueError("blind seats must be distinct live seats")
     start_stacks = list(stacks)
 
     in_hand = list(alive)
@@ -217,15 +235,17 @@ def play_hand(
             all_in[i] = True
 
     # Blinds and antes.
-    if len(players) == 2:
-        sb_seat, bb_seat = button, next_live(button, alive)
-    else:
-        sb_seat = next_live(button, alive)
-        bb_seat = next_live(sb_seat, alive)
+    if bb_seat is None:
+        if len(players) == 2:
+            sb_seat, bb_seat = button, next_live(button, alive)
+        else:
+            sb_seat = next_live(button, alive)
+            bb_seat = next_live(sb_seat, alive)
     if cfg.ante > 0:
         for i in players:
             post(i, cfg.ante)
-    post(sb_seat, cfg.small_blind)
+    if sb_seat is not None:
+        post(sb_seat, cfg.small_blind)
     post(bb_seat, cfg.big_blind)
 
     # Deal.
@@ -240,16 +260,18 @@ def play_hand(
     board: list[int] = []
 
     n_in_hand = len(players)
-    current_bet = max(bet)
+    # A short big blind does not lower the amount the others must call (Robert's Rules, blinds).
+    current_bet = max(max(bet), cfg.ante + cfg.big_blind)
     min_raise_inc = cfg.big_blind
-    acted_since_full: set[int] = set()
-    locked: set[int] = set()  # may only call or fold (facing a short all-in after acting)
+    acted_at: dict[int, int] = {}  # bet level at which each seat last acted since the last full raise
     payouts = cfg.payouts
     time_limit = cfg.time_limit_ns
 
     def observe(i: int, street: int) -> Observation:
         to_call = min(current_bet - bet[i], stacks[i])
-        can_raise = stacks[i] > to_call and i not in locked
+        # A player who already acted may raise again only if the bet has grown by at least a full
+        # raise since then (a short all-in alone does not reopen the action; TDA Rule 49-A).
+        can_raise = stacks[i] > to_call and (i not in acted_at or current_bet - acted_at[i] >= min_raise_inc)
         max_to = bet[i] + stacks[i]
         min_to = min(current_bet + min_raise_inc, max_to)
         return Observation(
@@ -281,6 +303,11 @@ def play_hand(
         errored = False
         try:
             action = bot.act(obs)
+            # A return value that is not a well-formed Action is an error: the bot is folded.
+            if not isinstance(action, Action) or not isinstance(action.kind, ActionKind):
+                raise TypeError("act() must return an Action")
+            if action.kind == ActionKind.RAISE:
+                action = Action(ActionKind.RAISE, int(action.amount))
         except Exception:
             action = FOLD
             errored = True
@@ -325,6 +352,11 @@ def play_hand(
             while cursor not in pending:
                 cursor = (cursor + 1) % n
             i = cursor
+            # Nothing to decide once everyone else is all-in or out and hero already covers every bet.
+            if not any(in_hand[j] and not all_in[j] for j in range(n) if j != i) and bet[i] >= max(
+                (bet[j] for j in range(n) if j != i), default=0
+            ):
+                break
             obs = observe(i, street)
             raw, dt, timed_out, errored = ask(i, obs)
             action, illegal = legalize(i, obs, raw)
@@ -350,16 +382,16 @@ def play_hand(
                 if inc >= min_raise_inc:
                     min_raise_inc = inc
                     pending = {j for j in range(n) if in_hand[j] and not all_in[j] and j != i}
-                    acted_since_full.clear()
-                    locked.clear()
-                else:  # short all-in: does not reopen the betting for players who already acted
+                    acted_at.clear()
+                else:
+                    # Short all-in: players who already acted must respond but may only raise once
+                    # the short raises since their action add up to a full raise (see observe()).
                     pending = {j for j in range(n) if in_hand[j] and not all_in[j] and j != i and bet[j] < current_bet}
-                    for j in pending & acted_since_full:
-                        locked.add(j)
-            acted_since_full.add(i)
+            acted_at[i] = current_bet
             pending.discard(i)
-            hist.append((street, i, int(kind), action.amount if kind == ActionKind.RAISE else obs.to_call))
-            records.append(ActionRecord(street, i, int(kind), action.amount, dt, timed_out, errored))
+            amount = action.amount if kind == ActionKind.RAISE else (obs.to_call if kind == ActionKind.CALL else 0)
+            hist.append((street, i, int(kind), amount))
+            records.append(ActionRecord(street, i, int(kind), amount, dt, timed_out, errored))
             cursor = (cursor + 1) % n
 
     def return_uncalled() -> None:
@@ -379,11 +411,10 @@ def play_hand(
             bet[j] = 0
         current_bet = 0
         min_raise_inc = cfg.big_blind
-        acted_since_full.clear()
-        locked.clear()
+        acted_at.clear()
 
     # Preflop.
-    first = sb_seat if len(players) == 2 else next_live(bb_seat, alive)
+    first = next_live(bb_seat, alive)  # heads-up this is the small blind, which is the button
     betting_round(first, Street.PREFLOP)
     return_uncalled()
     showdown = False
@@ -437,4 +468,6 @@ def play_hand(
         actions=records,
         showdown=showdown,
         winners=winners,
+        sb_seat=sb_seat,
+        bb_seat=bb_seat,
     )
