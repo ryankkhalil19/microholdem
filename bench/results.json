@@ -1,0 +1,188 @@
+{
+  "environment": {
+    "cpu": "Apple M1",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "python": "3.10.13",
+    "version": "0.1.0",
+    "numpy": "2.2.6"
+  },
+  "evaluator": {
+    "evals_per_sec_cpp_loop": 41018611.82219013,
+    "ns_per_eval_cpp_loop": 24.379177051014267,
+    "evals_per_sec_numpy_batch": 153487111.5319283,
+    "ns_per_python_call": 336.18396
+  },
+  "equity": {
+    "hu_preflop_samples_per_sec": 19196544.55991191,
+    "hu_flop_samples_per_sec": 26227859.887485854,
+    "hu_flop_vs_range_samples_per_sec": 5669595.821079254,
+    "eight_way_preflop_samples_per_sec": 12379455.063652601,
+    "exact_hu_preflop_enumeration_ms": 21.20374998776242
+  },
+  "icm": {
+    "icm_8_players_us": 1.7382229,
+    "icm_4_players_us": 0.5038791499999999
+  },
+  "solvers": {
+    "hu_pushfold_10bb_seconds": 0.04505516600329429,
+    "hu_pushfold_10bb_iterations": 150,
+    "hu_pushfold_10bb_exploitability_bb_per_hand": 3.3965844045608096e-05,
+    "hu_pushfold_10bb_sb_jam_fraction": 0.5835972863438185,
+    "shipped_hu_max_exploitability_bb_per_hand": 4.9226046499428744e-05,
+    "river_2pot_seconds": 0.7202315420145169,
+    "river_2pot_iterations": 2000,
+    "river_2pot_exploitability_pots": 6.734139559788632e-06,
+    "shipped_river_exploitability_pots": {
+      "0.5": 2.1757856135395937e-06,
+      "1": 1.8571637083741876e-06,
+      "2": 2.104792625828855e-06,
+      "4": 1.1101918765660246e-05,
+      "8": 1.1101918765660246e-05
+    }
+  },
+  "agent_latency": {
+    "default": {
+      "gc_mode": "default",
+      "cold_start_first_actions_us": [
+        20.459,
+        87.042,
+        5.542
+      ],
+      "duel": {
+        "hands": 4000,
+        "bb_per_100_vs_oracle": 178.1335,
+        "hands_per_sec": 3361.706251618095,
+        "actions": 13725,
+        "p50_us": 84.25,
+        "p90_us": 92.958,
+        "p99_us": 98.25,
+        "p999_us": 109.875,
+        "max_us": 128.583,
+        "mean_us": 62.85438950819672
+      },
+      "sng": {
+        "tables": 60,
+        "hands": 9116,
+        "hands_per_sec": 9628.256969609218,
+        "actions": 8654,
+        "p50_us": 7.083,
+        "p90_us": 92.708,
+        "p99_us": 101.292,
+        "p999_us": 112.834,
+        "max_us": 121.5,
+        "mean_us": 39.06266165934828
+      },
+      "timeouts": 0,
+      "errors": 0,
+      "illegal_actions": 0,
+      "calibration": {
+        "ns_base": 121.8,
+        "ns_per_opponent_sample": 64.2,
+        "equity_budget_ns": 100000,
+        "max_samples": 800
+      }
+    },
+    "frozen": {
+      "gc_mode": "frozen",
+      "cold_start_first_actions_us": [
+        9.5,
+        86.083,
+        4.958
+      ],
+      "duel": {
+        "hands": 4000,
+        "bb_per_100_vs_oracle": 172.5605,
+        "hands_per_sec": 3381.487833559356,
+        "actions": 13711,
+        "p50_us": 84.0,
+        "p90_us": 92.791,
+        "p99_us": 97.75,
+        "p999_us": 111.333,
+        "max_us": 121.875,
+        "mean_us": 62.61408671869302
+      },
+      "sng": {
+        "tables": 60,
+        "hands": 9116,
+        "hands_per_sec": 9659.771898197041,
+        "actions": 8653,
+        "p50_us": 7.042,
+        "p90_us": 92.5,
+        "p99_us": 100.875,
+        "p999_us": 111.584,
+        "max_us": 122.25,
+        "mean_us": 38.93793874956663
+      },
+      "timeouts": 0,
+      "errors": 0,
+      "illegal_actions": 0,
+      "calibration": {
+        "ns_base": 121.6,
+        "ns_per_opponent_sample": 64.7,
+        "equity_budget_ns": 100000,
+        "max_samples": 800
+      }
+    }
+  },
+  "simulator": {
+    "sng_archetypes_only_hands_per_sec": 14829.35050771311,
+    "sng_archetypes_only_hands": 10396,
+    "duel_archetypes_hands_per_sec": 14341.215337450236,
+    "ring_8max_archetypes_hands_per_sec": 8596.615131225319
+  },
+  "sng_results": {
+    "tables": 200,
+    "points": [
+      50.0,
+      30.0,
+      20.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rows": [
+      {
+        "bot": "micro",
+        "avg_points": 26.448631250000002,
+        "wins": 75
+      },
+      {
+        "bot": "passenger",
+        "avg_points": 24.50703125,
+        "wins": 0
+      },
+      {
+        "bot": "granite",
+        "avg_points": 18.4555125,
+        "wins": 31
+      },
+      {
+        "bot": "jammer",
+        "avg_points": 13.701506249999998,
+        "wins": 41
+      },
+      {
+        "bot": "oracle",
+        "avg_points": 7.35,
+        "wins": 25
+      },
+      {
+        "bot": "sponge",
+        "avg_points": 4.23731875,
+        "wins": 12
+      },
+      {
+        "bot": "blitz",
+        "avg_points": 3.45,
+        "wins": 11
+      },
+      {
+        "bot": "scatter",
+        "avg_points": 1.85,
+        "wins": 5
+      }
+    ]
+  }
+}
