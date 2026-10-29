@@ -44,16 +44,22 @@ def icm_delta(
 ) -> float:
     """Hero's ICM equity after a hypothetical chip transfer.
 
-    If ``loser`` is given, the chips hero gains are taken from that player
-    (and vice versa for a loss); otherwise the delta is applied to hero only
-    and the pot is assumed to come from the players proportionally (approximation
-    used when several opponents are involved).
+    If ``loser`` is given, the chips hero gains are taken from that player (and
+    vice versa for a loss), and a transfer larger than the loser's stack raises.
+    Otherwise only hero's stack changes and the total grows by the delta, which
+    under ICM is the same as hero taking ``delta * (T - h) / (T + delta)`` chips
+    from the others in proportion to their stacks (``T`` total, ``h`` hero's
+    stack); a rough approximation used when several opponents are involved.
     """
     s = [float(x) for x in stacks]
+    if new_hero_stack < 0:
+        raise ValueError("hero's stack cannot be negative")
     delta = new_hero_stack - s[hero]
     s[hero] = new_hero_stack
     if loser is not None and loser != hero:
-        s[loser] = max(0.0, s[loser] - delta)
+        if delta > s[loser]:
+            raise ValueError("transfer exceeds the loser's stack")
+        s[loser] -= delta
     return icm_equity(s, payouts)[hero]
 
 
@@ -63,6 +69,8 @@ def risk_premium(stacks: Sequence[float], payouts: Sequence[float], hero: int, v
     Returns the required win probability; the chip-EV break-even would be the pot odds.
     A value above the pot odds is the ICM risk premium ("bubble factor").
     """
+    if pot <= 0 or hero == villain:
+        raise ValueError("pot must be positive and hero must differ from villain")
     s = [float(x) for x in stacks]
     base = icm_equity(s, payouts)[hero]
     win = list(s)

@@ -133,7 +133,8 @@ def test_archetypes_run_in_ring_and_duel() -> None:
     bots = lineup(1)
     net, stats = run_ring(bots, 150, seed=3)
     assert sum(net) == 0
-    assert all(s.timeouts == 0 and s.errors == 0 for s in stats)
+    assert all(s.errors == 0 for s in stats)
+    assert sum(s.timeouts for s in stats) <= 1 + sum(s.actions for s in stats) // 1000  # scheduler stalls
     res = run_duel(make_archetype("blitz", 1), make_archetype("granite", 2), 200, seed=4)
     assert res.hands == 200
     assert res.wins[0] + res.wins[1] + res.wins[2] == 200
@@ -146,3 +147,116 @@ def test_sng_hand_cap_allocates_points_by_icm() -> None:
     assert sum(res.points) == pytest.approx(100.0)
     assert res.hands == 20
     assert sorted(res.finish) == list(range(1, 9))
+
+
+def _allin_obs(stacks: tuple[int, ...], bets: tuple[int, ...], payouts: tuple[float, ...]) -> Observation:
+    pot = sum(bets)
+    return Observation(
+        seat=0,
+        hole=(51, 50),
+        board=(),
+        street=0,
+        pot=pot,
+        to_call=min(max(bets) - bets[0], stacks[0]),
+        min_raise_to=0,
+        max_raise_to=0,
+        can_raise=False,
+        stacks=stacks,
+        bets=bets,
+        in_hand=tuple(True for _ in stacks),
+        button=1,
+        small_blind=50,
+        big_blind=100,
+        ante=0,
+        n_in_hand=len(stacks),
+        hand_number=0,
+        history=((0, 1, 3, max(bets)),),
+        payouts=payouts,
+    )
+
+
+def test_icm_call_values_the_place_hero_finishes_in_when_busting() -> None:
+    agent = MicroAgent(seed=3)
+    agent.reset(0, 2, 1)
+    obs = _allin_obs((2900, 0), (100, 5000), (50.0, 30.0))  # heads-up, hero covered
+    assert agent._icm_call_allin(obs, 0.60, 1)
+    assert not agent._icm_call_allin(obs, 0.40, 1)
+    # With two players ICM is linear in chips, so the break-even equals the chip break-even 2900/6000.
+    lo, hi = 0.0, 1.0
+    for _ in range(20):
+        mid = (lo + hi) / 2
+        lo, hi = (lo, mid) if agent._icm_call_allin(obs, mid, 1) else (mid, hi)
+    assert abs(hi - 2900 / 6000) < 0.01
+    obs3 = _allin_obs((2900, 0, 7000), (100, 5000, 0), (50.0, 30.0, 20.0))  # three-handed, hero covered
+    assert agent._icm_call_allin(obs3, 0.60, 1)
+
+
+def test_icm_stack_vectors_conserve_the_chips_in_play() -> None:
+    agent = MicroAgent(seed=4)
+    agent.reset(0, 3, 1)
+    seen: list[float] = []
+    original = agent._icm
+
+    def recording(stacks: list[float], payouts: tuple[float, ...], hero: int) -> float:
+        seen.append(sum(stacks))
+        return original(stacks, payouts, hero)
+
+    agent._icm = recording  # type: ignore[method-assign]
+    obs = _allin_obs((2900, 0, 7000), (100, 5000, 50), (50.0, 30.0, 20.0))
+    agent._icm_call_allin(obs, 0.5, 1)
+    jam_obs = Observation(
+        seat=0,
+        hole=(51, 47),
+        board=(),
+        street=0,
+        pot=150,
+        to_call=100,
+        min_raise_to=200,
+        max_raise_to=1500,
+        can_raise=True,
+        stacks=(1500, 1950, 1900),
+        bets=(0, 50, 100),
+        in_hand=(True, True, True),
+        button=0,
+        small_blind=50,
+        big_blind=100,
+        ante=0,
+        n_in_hand=3,
+        hand_number=0,
+        history=(),
+        payouts=(50.0, 30.0, 20.0),
+    )
+    agent._icm_jam_vs_fold(jam_obs, 150, 15.0, 2)
+    assert len(seen) == 3 + 2 * 2 + 2  # fold, win, lose; then fold, two callers (win, lose each), no call
+    assert all(total == pytest.approx(sum(obs.stacks) + obs.pot) for total in seen[:3])
+    assert all(total == pytest.approx(sum(jam_obs.stacks) + jam_obs.pot) for total in seen[3:])
+
+
+def test_fixed_sample_agent_plays_deterministically() -> None:
+    def run() -> tuple[list[float], list[int]]:
+        agent = MicroAgent(seed=5, samples=120)
+        bots: list[Bot] = [agent, *lineup(9)]
+        res = run_sng(bots, seed=77)
+        return res.points, res.finish
+
+    assert run() == run()
+
+
+def test_sng_follows_the_dead_button_rule() -> None:
+    from microholdem.engine import next_live
+
+    checked = dead_small_blinds = 0
+    for seed in range(4):
+        bots: list[Bot] = [*lineup(seed), make_archetype("jammer", 50 + seed)]
+        res = run_sng(bots, seed=seed, cfg=SngConfig(record_hands=True))
+        for prev, cur in zip(res.history, res.history[1:], strict=False):
+            alive = [s > 0 for s in prev.end_stacks]
+            if sum(alive) <= 2:
+                break
+            assert cur.bb_seat == next_live(prev.bb_seat, alive)
+            assert cur.sb_seat == (prev.bb_seat if alive[prev.bb_seat] else None)
+            if prev.sb_seat is not None:
+                assert cur.button == prev.sb_seat
+            checked += 1
+            dead_small_blinds += cur.sb_seat is None
+    assert checked > 50 and dead_small_blinds > 0

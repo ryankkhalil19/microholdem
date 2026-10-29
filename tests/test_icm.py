@@ -48,3 +48,31 @@ def test_allocate_points_at_hand_cap() -> None:
     pts = allocate_points([6000, 4000, 2000], [50, 30, 20])
     assert sum(pts) == pytest.approx(100.0)
     assert pts[0] > pts[1] > pts[2]
+
+
+def test_lopsided_and_non_integer_stacks_keep_precision() -> None:
+    ev = icm_equity([1e16, 1, 1, 1], [50, 30, 20])
+    assert sum(ev) == pytest.approx(100.0)
+    assert ev[1] == pytest.approx(50.0 / 3.0, rel=1e-9)
+    ev = icm_equity([1e7 + 0.1, 0.1, 0.1, 0.1], [50, 30, 20])
+    assert ev[1] == pytest.approx(16.66666686666666, abs=1e-9)
+
+
+def test_zero_stack_players_get_nothing_and_unfillable_places_are_dropped() -> None:
+    # Callers that model a bust must add the finishing-place payout themselves (the agent does).
+    assert icm_equity([0, 6000], [50, 30]) == pytest.approx([0.0, 50.0])
+
+
+def test_delta_and_premium_validate_their_inputs() -> None:
+    from microholdem.icm import icm_delta
+
+    stacks = [4000, 3000, 3000, 2000]
+    assert icm_delta(stacks, [50, 30, 20], hero=1, new_hero_stack=4000, loser=2) == pytest.approx(
+        icm_equity([4000, 4000, 2000, 2000], [50, 30, 20])[1]
+    )
+    with pytest.raises(ValueError):
+        icm_delta(stacks, [50, 30, 20], hero=1, new_hero_stack=5500, loser=3)
+    with pytest.raises(ValueError):
+        risk_premium(stacks, [50, 30, 20], hero=1, villain=2, pot=0)
+    with pytest.raises(ValueError):
+        risk_premium(stacks, [50, 30, 20], hero=1, villain=1, pot=100)

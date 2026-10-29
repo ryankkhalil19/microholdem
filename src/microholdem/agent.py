@@ -71,6 +71,7 @@ class MicroAgent:
         min_samples: int = 48,
         tb: Tables | None = None,
         gc_freeze: bool = False,
+        samples: int | None = None,
     ) -> None:
         self.tb = tb or tables()
         self.rng = random.Random(seed)
@@ -80,6 +81,9 @@ class MicroAgent:
         self.equity_budget_ns = equity_budget_ns
         self.max_samples = max_samples
         self.min_samples = min_samples
+        # Fixed Monte Carlo sample count: decisions then depend only on the seeds (used for
+        # reproducible strength measurements). None means the time budget chooses the count.
+        self.samples = samples
         self._ranges: dict[float, _core.CompiledRange] = {
             f: Range.top_fraction([int(x) for x in self.tb.order_multi], f).compile() for f in RANGE_FRACTIONS
         }
@@ -87,7 +91,7 @@ class MicroAgent:
         self._class_ranges: dict[float, npt.NDArray[np.float64]] = {
             f: Range.top_fraction([int(x) for x in self.tb.order_multi], f).weights for f in RANGE_FRACTIONS
         }
-        self.ns_base, self.ns_per_opp = self._calibrate()
+        self.ns_cost: list[float] = self._calibrate()
         self.last_samples = 0
         self.last_latency_ns = 0
         self.decisions = 0
@@ -98,20 +102,28 @@ class MicroAgent:
             gc.freeze()
 
     # ------------------------------------------------------------------
-    def _calibrate(self) -> tuple[float, float]:
+    def _calibrate(self) -> list[float]:
+        """Per-sample cost (ns) of the equity call, indexed by the number of opponent ranges.
+
+        Measured at construction on a flop board with a mid-width range for one and for seven
+        opponents, interpolated linearly in between, and corrected online from every real call
+        (see :meth:`_equity`), because the cost depends on the board, the range widths and the
+        rejection rate.
+        """
         hero: list[int] = [48, 51]
-        board: list[int] = []
-        best1 = best4 = float("inf")
+        board: list[int] = [8, 21, 34]
+        rng = self._ranges[0.30]
+        best1 = best7 = float("inf")
         for _ in range(3):
             t0 = time.perf_counter_ns()
-            _core.equity_vs_compiled(hero, board, [self._range_random], 2000, 7)
+            _core.equity_vs_compiled(hero, board, [rng], 2000, 7)
             best1 = min(best1, (time.perf_counter_ns() - t0) / 2000.0)
             t0 = time.perf_counter_ns()
-            _core.equity_vs_compiled(hero, board, [self._range_random] * 4, 2000, 7)
-            best4 = min(best4, (time.perf_counter_ns() - t0) / 2000.0)
-        per_opp = max(5.0, (best4 - best1) / 3.0)
+            _core.equity_vs_compiled(hero, board, [rng] * 7, 2000, 7)
+            best7 = min(best7, (time.perf_counter_ns() - t0) / 2000.0)
+        per_opp = max(5.0, (best7 - best1) / 6.0)
         base = max(10.0, best1 - per_opp)
-        return base, per_opp
+        return [base + per_opp * k for k in range(10)]
 
     def reset(self, seat: int, n_seats: int, seed: int) -> None:
         self.seat = seat
@@ -169,19 +181,46 @@ class MicroAgent:
     def _icm(stacks: list[float], payouts: tuple[float, ...], hero: int) -> float:
         return float(_core.icm_equity(stacks, list(payouts))[hero])
 
+    @staticmethod
+    def _bust_payout(payouts: tuple[float, ...], n_live: int) -> float:
+        """Payout of the place a player takes when busting with ``n_live`` players left."""
+        return float(payouts[n_live - 1]) if 0 < n_live <= len(payouts) else 0.0
+
+    def _icm_after_loss(self, stacks: list[float], payouts: tuple[float, ...], hero: int, n_live: int) -> float:
+        """Hero's ICM equity for a stack vector in which hero may have busted.
+
+        ``icm_equity`` pays nothing to a zero stack (the place it would fill is dropped), so the
+        payout of the place hero finishes in is added back when hero is out.
+        """
+        ev = self._icm(stacks, payouts, hero)
+        if stacks[hero] <= 0.0:
+            ev += self._bust_payout(payouts, n_live)
+        return ev
+
+    @staticmethod
+    def _others_after(obs: Observation) -> list[int]:
+        """Opponents still in the hand, clockwise from hero; for a first-in player the big blind is last."""
+        n = len(obs.stacks)
+        return [(obs.seat + d) % n for d in range(1, n) if obs.in_hand[(obs.seat + d) % n]]
+
     def _icm_jam_vs_fold(self, obs: Observation, cls: int, eff_bb: float, k: int) -> bool:
-        """ICM expected value of a first-in jam versus folding (no-overcall model)."""
+        """ICM expected value of a first-in jam versus folding (no-overcall model).
+
+        Every stack vector handed to the ICM conserves the chips in play: when hero folds, the
+        players who posted keep their blinds and hero's own posted chips go to the big blind; when a
+        caller is resolved, the other opponents' posted chips are dead money for the showdown winner.
+        """
         hero = obs.seat
         n = len(obs.stacks)
         tot = [float(obs.stacks[i] + obs.bets[i]) for i in range(n)]
         bets = [float(b) for b in obs.bets]
-        others = [i for i in range(n) if i != hero and obs.in_hand[i]]
+        n_live = sum(1 for t in tot if t > 0.0)
+        others = self._others_after(obs)
         payouts = obs.payouts
-        # Fold: hero keeps the stack behind; the posted chips go to the last player to act.
-        fold_stacks = list(tot)
-        fold_stacks[hero] = float(obs.stacks[hero])
-        pot_now = sum(bets)
-        fold_stacks[others[-1]] += pot_now
+        fold_stacks = [float(obs.stacks[i]) for i in range(n)]
+        for j in others:
+            fold_stacks[j] += bets[j]
+        fold_stacks[others[-1]] += bets[hero]
         ev_fold = self._icm(fold_stacks, payouts, hero)
         calls = self.tb.call_ranges(eff_bb, k + 1)
         survive = 1.0
@@ -202,7 +241,9 @@ class MicroAgent:
             win[i] = tot[i] - risk
             lose[hero] = tot[hero] - risk
             lose[i] = tot[i] + risk + (dead_others - bets[i])
-            ev_call = eq * self._icm(win, payouts, hero) + (1.0 - eq) * self._icm(lose, payouts, hero)
+            ev_call = eq * self._icm(win, payouts, hero) + (1.0 - eq) * self._icm_after_loss(
+                lose, payouts, hero, n_live
+            )
             ev_jam += survive * p_call * ev_call
             survive *= 1.0 - p_call
         nocall = list(tot)
@@ -213,31 +254,28 @@ class MicroAgent:
         return ev_jam > ev_fold
 
     def _icm_call_allin(self, obs: Observation, eq: float, villain: int) -> bool:
-        """Call an all-in (or a stack-committing bet) if ICM EV(call) > ICM EV(fold)."""
+        """Call an all-in (or a stack-committing bet) if ICM EV(call) > ICM EV(fold).
+
+        When hero folds the villain wins every chip committed so far, hero's included. When hero
+        loses the showdown while covered, the payout of hero's finishing place is counted.
+        """
         hero = obs.seat
         n = len(obs.stacks)
         tot = [float(obs.stacks[i] + obs.bets[i]) for i in range(n)]
+        n_live = sum(1 for t in tot if t > 0.0)
         payouts = obs.payouts
-        fold_stacks = list(tot)
-        fold_stacks[hero] = float(obs.stacks[hero])
-        fold_stacks[villain] += float(obs.pot) - float(obs.bets[hero])  # villain scoops what is there
-        for j in range(n):
-            if j not in (hero, villain):
-                fold_stacks[j] = float(obs.stacks[j])
+        fold_stacks = [float(obs.stacks[j]) for j in range(n)]
+        fold_stacks[villain] += float(obs.pot)
         ev_fold = self._icm(fold_stacks, payouts, hero)
         risk = min(tot[hero], tot[villain])
         dead = float(obs.pot) - float(obs.bets[hero]) - float(obs.bets[villain])
-        win = list(tot)
-        lose = list(tot)
-        for j in range(n):
-            if j not in (hero, villain):
-                win[j] = float(obs.stacks[j])
-                lose[j] = float(obs.stacks[j])
+        win = [float(obs.stacks[j]) for j in range(n)]
+        lose = list(win)
         win[hero] = tot[hero] + risk + dead
         win[villain] = tot[villain] - risk
         lose[hero] = tot[hero] - risk
         lose[villain] = tot[villain] + risk + dead
-        ev_call = eq * self._icm(win, payouts, hero) + (1.0 - eq) * self._icm(lose, payouts, hero)
+        ev_call = eq * self._icm(win, payouts, hero) + (1.0 - eq) * self._icm_after_loss(lose, payouts, hero, n_live)
         return ev_call > ev_fold
 
     # ------------------------------------------------------------------
@@ -375,14 +413,24 @@ class MicroAgent:
         return out or [self._range_random]
 
     def _equity(self, obs: Observation, t0: int, ranges: list[_core.CompiledRange]) -> float:
+        k = len(ranges)
+        seed = self.rng.getrandbits(62)
+        if self.samples is not None:
+            n = max(1, min(self.max_samples, self.samples))
+            self.last_samples = n
+            return float(_core.equity_vs_compiled(list(obs.hole), list(obs.board), ranges, n, seed))
         elapsed = time.perf_counter_ns() - t0
         remaining = self.equity_budget_ns - elapsed
-        cost = self.ns_base + self.ns_per_opp * len(ranges)
+        cost = self.ns_cost[k]
         n = int(remaining / cost) if remaining > 0 else self.min_samples
         n = max(self.min_samples, min(self.max_samples, n))
         self.last_samples = n
-        seed = self.rng.getrandbits(62)
-        return float(_core.equity_vs_compiled(list(obs.hole), list(obs.board), ranges, n, seed))
+        t1 = time.perf_counter_ns()
+        eq = float(_core.equity_vs_compiled(list(obs.hole), list(obs.board), ranges, n, seed))
+        # Online correction of the per-sample cost for this opponent count (exponential moving
+        # average), so multiway boards with heavy rejection do not overrun the budget repeatedly.
+        self.ns_cost[k] = 0.75 * cost + 0.25 * (time.perf_counter_ns() - t1) / n
+        return eq
 
     def _postflop(self, obs: Observation, t0: int) -> Action:
         n_opp = max(1, obs.n_in_hand - 1)
@@ -507,8 +555,9 @@ def is_bb_vs_open(obs: Observation) -> bool:
 
 def describe(agent: MicroAgent) -> dict[str, Any]:
     return {
-        "ns_base": round(agent.ns_base, 1),
-        "ns_per_opponent_sample": round(agent.ns_per_opp, 1),
+        "ns_per_sample_1_opponent": round(agent.ns_cost[1], 1),
+        "ns_per_sample_7_opponents": round(agent.ns_cost[7], 1),
         "equity_budget_ns": agent.equity_budget_ns,
         "max_samples": agent.max_samples,
+        "fixed_samples": agent.samples,
     }
