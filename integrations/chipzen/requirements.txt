@@ -1,0 +1,2 @@
+chipzen-bot==0.7.0
+numpy==2.2.6
