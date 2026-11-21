@@ -1,0 +1,3 @@
+# chipzen.toml holds the remote-play token (cz_extbot_...): never commit it.
+chipzen.toml
+*.tar.gz

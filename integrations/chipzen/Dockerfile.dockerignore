@@ -1,0 +1,12 @@
+# Build context is the repository root; send only what the Dockerfile copies.
+*
+!pyproject.toml
+!setup.py
+!README.md
+!LICENSE
+!src/
+!integrations/chipzen/bot.py
+!integrations/chipzen/requirements.txt
+**/__pycache__
+**/*.so
+**/*.pyc
