@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from microholdem.agent import MicroAgent
@@ -145,6 +147,95 @@ def test_calls_a_frequent_reraiser_wider() -> None:
     for _ in range(40):
         agent.observe_hand([(0, 0, RAISE, 250), (0, 1, RAISE, 900), (0, 0, FOLD, 0)], 0, 0, 100, 10_000)
     assert agent.act(obs("Kd 9s", **reraised)).kind == ActionKind.CALL
+
+
+def short_open(hole: str, stack_bb: float, open_to: int = 645, big_blind: int = 300) -> Observation:
+    """Big blind with ``stack_bb`` big blinds against a button open to ``open_to``; the button covers."""
+    stack = int(stack_bb * big_blind)
+    return obs(
+        hole,
+        seat=1,
+        button=0,
+        pot=open_to + big_blind,
+        to_call=open_to - big_blind,
+        min_raise_to=2 * open_to - big_blind,
+        max_raise_to=stack,
+        stacks=(20_000 - stack - open_to, stack - big_blind),
+        bets=(open_to, big_blind),
+        small_blind=big_blind // 2,
+        big_blind=big_blind,
+        history=((0, 0, RAISE, open_to),),
+    )
+
+
+def reply_mix(agent: HeadsUpAgent, stack_bb: float) -> dict[ActionKind, float]:
+    """Share of the 1,326 starting hands the agent folds, calls and shoves in :func:`short_open`."""
+    ranks = "23456789TJQKA"
+    mix = dict.fromkeys((ActionKind.FOLD, ActionKind.CALL, ActionKind.RAISE), 0.0)
+    for i, high in enumerate(ranks):
+        for low in ranks[: i + 1]:
+            hands = [(f"{high}h {low}d", 6)] if high == low else [(f"{high}s {low}s", 4), (f"{high}h {low}d", 12)]
+            for hole, combos in hands:
+                mix[agent.act(short_open(hole, stack_bb)).kind] += combos / 1326
+    return mix
+
+
+def test_a_short_stack_does_not_shove_every_hand_over_an_open() -> None:
+    # Chatterbox v megaholdem, hands 71 and 79: nine-seven and eight-seven offsuit were shoved for
+    # 19 and 17 big blinds over a 2.15x open, as the parent does with every hand at this depth.
+    assert MicroAgent(seed=1, samples=64).act(short_open("9d 7c", 5_788 / 300)).kind == ActionKind.RAISE
+    agent = HeadsUpAgent(seed=1, samples=64)
+    assert agent.act(short_open("9d 7c", 5_788 / 300)).kind != ActionKind.RAISE
+    assert agent.act(short_open("7h 8c", 5_215 / 300)).kind != ActionKind.RAISE
+    assert agent.act(short_open("7d 2c", 19)).kind == ActionKind.FOLD
+    for hole in ("As Ad", "Ah Kd", "8s 8d"):
+        shove = agent.act(short_open(hole, 19))
+        assert shove.kind == ActionKind.RAISE and shove.amount == 19 * 300
+
+
+@pytest.mark.parametrize("stack_bb", [8, 12, 16, 20])
+def test_short_reply_shoves_a_minority_of_hands_and_more_of_them_when_shorter(stack_bb: int) -> None:
+    agent = HeadsUpAgent(seed=1, samples=64)
+    mix = reply_mix(agent, stack_bb)
+    assert 0.25 <= mix[ActionKind.RAISE] <= 0.55
+    assert mix[ActionKind.FOLD] >= 0.10
+    assert mix[ActionKind.RAISE] >= reply_mix(agent, 20)[ActionKind.RAISE] - 1e-9
+
+
+def test_fold_to_shove_follows_the_price_and_then_the_opponent() -> None:
+    agent = HeadsUpAgent(seed=1, samples=64)
+    lo, hi = agent._villain_slice(short_open("9d 7c", 19))
+    by_depth = [agent._fold_to_shove(short_open("9d 7c", n), lo, hi) for n in (6, 8, 12, 16, 20)]
+    assert by_depth == sorted(by_depth)  # the better the raiser's price, the less it folds
+    assert by_depth[0] == 0.0  # an open that is a third of the stack is never folded
+    assert 0.45 <= by_depth[-1] <= 0.70
+
+    def answers(kind: int) -> HeadsUpAgent:
+        seen = HeadsUpAgent(seed=1, samples=64)
+        reply = (0, 0, kind, 5_055 if kind == CALL else 0)
+        for _ in range(12):
+            seen.observe_hand([(0, 0, RAISE, 645), (0, 1, RAISE, 5_700), reply], 1, 0, 300, 5_700)
+        return seen
+
+    caller, folder = answers(CALL), answers(FOLD)
+    assert caller.model.rate("fold_to_jam") < 0.2 < 0.8 < folder.model.rate("fold_to_jam")
+    # Against a seat that folds its opens, any two cards are a shove; against one that calls, they are not.
+    assert folder.act(short_open("7d 2c", 19)).kind == ActionKind.RAISE
+    assert caller.act(short_open("9d 7c", 19)).kind != ActionKind.RAISE
+    assert reply_mix(caller, 19)[ActionKind.RAISE] < 0.5
+
+
+def test_a_small_reraise_is_not_counted_as_a_shove() -> None:
+    m = OpponentModel()
+    m.observe_hand([(0, 1, RAISE, 250), (0, 0, RAISE, 900), (0, 1, FOLD, 0)], 0, 1, 100, 10_000)
+    assert m.seen["fold_to_3bet"] == 1 and m.seen["fold_to_jam"] == 0
+
+
+def test_short_reply_leaves_other_spots_to_the_parent() -> None:
+    assert HeadsUpAgent._is_short_reply(short_open("9d 7c", 20))
+    assert not HeadsUpAgent._is_short_reply(short_open("9d 7c", 21))  # above the push-or-fold depth
+    assert not HeadsUpAgent._is_short_reply(replace(short_open("9d 7c", 19), stacks=(0, 5_400)))  # the button is all-in
+    assert not HeadsUpAgent._is_short_reply(obs("9d 7c", stacks=(1_950, 1_900)))  # small blind, nobody has raised
 
 
 def flop(history: tuple[tuple[int, int, int, int], ...], street: int = 1) -> Observation:

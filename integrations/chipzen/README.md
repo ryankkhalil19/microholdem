@@ -35,17 +35,18 @@ depends only on the seed and repeats exactly. `v1` is the adapter as first uploa
 
 | Opponent | v1 (deployed) | This version | Matches each |
 |---|---:|---:|---:|
-| v1, head to head | | 69.1% (95% CI 67.0 to 71.1) | 2,000 |
+| v1, head to head | | 68.3% (95% CI 66.2 to 70.3) | 2,000 |
 | v1 with only the two fixes above, head to head | | 56.8% (54.6 to 59.0) | 2,000 |
-| minraiser (opens 80% for the minimum, bets half the time; after 6BP9) | 42.7% | 61.9% | 1,000 |
-| barreler (opens or limps 96%, re-raises 19%, shoves 8%; after Phineas-IV) | 59.4% | 68.9% | 1,000 |
+| minraiser (opens 80% for the minimum, bets half the time; after 6BP9) | 42.7% | 60.6% | 1,000 |
+| barreler (opens or limps 96%, re-raises 19%, shoves 8%; after Phineas-IV) | 59.4% | 67.3% | 1,000 |
 | station (limps everything, rarely folds; after glambot) | 77.2% | 96.6% | 1,000 |
-| regular (opens 72%, re-raises 12%) | 64.2% | 77.1% | 1,000 |
-| oracle, granite, jammer, sponge (microholdem archetypes) | 68.6, 86.4, 65.6, 71.1% | 90.7, 90.9, 78.8, 94.3% | 1,000 |
-| blitz (raises most hands, shoves 15% of its raises) | 63.9% | 57.1% | 1,000 |
-| All nine pool opponents | 66.6% | 79.6% | 9,000 |
+| regular (opens 72%, re-raises 12%) | 64.2% | 76.6% | 1,000 |
+| sticky (never folds before the flop, calls a shove with 45% of hands; after Chatterbox) | 61.4% | 80.7% | 1,000 |
+| oracle, granite, jammer, sponge (microholdem archetypes) | 68.6, 86.4, 65.6, 71.1% | 90.8, 95.0, 78.8, 94.3% | 1,000 |
+| blitz (raises most hands, shoves 15% of its raises) | 63.9% | 57.3% | 1,000 |
+| All ten pool opponents | 66.1% | 79.8% | 10,000 |
 
-Reproduce (about 12 minutes on eight cores):
+Reproduce (about 13 minutes on eight cores):
 
 ```bash
 git show b5420dd:integrations/chipzen/bot.py > /tmp/bot_v1.py
@@ -55,10 +56,29 @@ python arena.py --a /tmp/bot_v1.py --pool --matches 1000
 ```
 
 What this does and does not show. The pool opponents are simple bots written for this benchmark,
-four of them shaped on frequencies read from replays; they are not the bots on the platform, and a
+five of them shaped on frequencies read from replays; they are not the bots on the platform, and a
 win rate against them is not a forecast of a ladder rating. The version is worse against blitz,
 the one opponent that raises and shoves almost at random. The head-to-head result is the firm one:
 the same engine, the same seeds, and only the adapter and agent changed.
+
+## Short stacks against an open
+
+The first upload of this version lost the last hand of its first rated match by shoving eight-seven
+offsuit for 17 big blinds over a 2.15x open. With 20 big blinds or fewer, `MicroAgent` prices a reply
+to a small open as a call of that open and then shoves the whole stack, so it shoves every hand. The
+first adapter never reached that code, because it believed the blinds were still 50/100.
+
+`HeadsUpAgent` now values folding, calling and shoving in chips and plays the best of the three. A
+shove is valued against how often the opener folds to one. With no shoves seen, that is the fold rate
+of the shove-or-not game solved for that stack and that opening range (61% at 20 big blinds, 33% at
+10); every shove the opponent answers moves it towards the opponent's own rate. A fresh agent shoves
+about a third of its hands at 20 big blinds and 44% at 10.
+
+This is not a gain in the arena. Against the same bot with `HeadsUpAgent._is_short_reply` returning
+False, which is the old behaviour, it wins 50.4% of 2,000 matches (95% CI 48.2 to 52.6), and its pool
+results moved within noise. The spot is rare, and four of the five profile opponents fold all but the
+top 6% of hands to a shove, against which shoving everything is the best play. The change matters
+against opponents that call: there the old line loses the stack as an underdog, and this one does not.
 
 ## Differences from microholdem's own engine
 

@@ -16,7 +16,7 @@ from chipzen import GameState
 
 from microholdem.agent import MicroAgent
 from microholdem.archetypes import make_archetype
-from microholdem.cards import card_str
+from microholdem.cards import card_str, parse_cards
 from microholdem.engine import CALL, CHECK, FOLD, ActionKind, HandConfig, Observation, play_hand
 from microholdem.engine import Action as AgentAction
 from microholdem.engine import Bot as EngineBot
@@ -412,3 +412,18 @@ def test_arena_plays_the_chipzen_format_to_a_winner() -> None:
     assert bot.agent.model.hands == result.hands
     # The bot saw the blinds rise: it is within one level of where the match ended.
     assert bot.big_blind >= blinds_for_hand(max(0, result.hands - 21))[1]
+
+
+def test_pool_opponents_differ_in_how_they_answer_a_shove() -> None:
+    from arena import make_opponent
+
+    # The button opened to 645 at 150/300 and the big blind shoved 5,700: Chatterbox called this with king-eight.
+    hole = parse_cards("Kh 8s")
+    shoved = Observation(
+        seat=0, hole=(hole[0], hole[1]), board=(), street=0, pot=6_345, to_call=5_055, min_raise_to=10_755,
+        max_raise_to=14_300, can_raise=True, stacks=(13_655, 0), bets=(645, 5_700), in_hand=(True, True), button=0,
+        small_blind=150, big_blind=300, ante=0, n_in_hand=2, hand_number=71,
+        history=((0, 0, int(ActionKind.RAISE), 645), (0, 1, int(ActionKind.RAISE), 5_700)), payouts=(),
+    )  # fmt: skip
+    assert make_opponent("sticky", 1).act(shoved) == CALL
+    assert make_opponent("regular", 1).act(shoved) == FOLD

@@ -99,7 +99,7 @@ it is why the agent's result is reported as points and table wins rather than as
 ```bash
 git clone https://github.com/ryankkhalil19/microholdem && cd microholdem
 python -m pip install -e ".[dev]"          # builds the C++ extension (needs a C++17 compiler)
-pytest -q                                   # 84 tests, about 10 s, includes the exhaustive 7-card census
+pytest -q                                   # 92 tests, about 10 s, includes the exhaustive 7-card census
 ruff check src tests && mypy               # lint and strict type check (package and tests)
 python -m microholdem.bench --out bench    # full benchmark, about 15 s
 python -m microholdem.simulate sng --tables 100 --lineup micro,granite,blitz,sponge,oracle,jammer,scatter,passenger
@@ -166,11 +166,14 @@ and an ICM risk premium on stack-committing calls.
 ### Heads-up agent
 
 `headsup.HeadsUpAgent` extends the agent for two-seat tables and defers to it at larger ones. It keeps
-`OpponentModel`, ten smoothed frequencies of the seat across the table (opens, limps, re-raises, shoves,
-postflop bets, raises and folds), updated once per finished hand. Pot odds are taken on the chips the agent
+`OpponentModel`, eleven smoothed frequencies of the seat across the table (opens, limps, re-raises, shoves,
+folds to a shove, postflop bets, raises and folds), updated once per finished hand. Pot odds are taken on the chips the agent
 can actually win (`callable_view` caps a covering shove at the callable part). A re-raise is answered by
 price: the re-raiser gets the top slice of hands matching how often it has re-raised, and the agent continues
-when equity times a position discount covers the pot odds. Postflop, the opponent's range is laid out by
+when equity times a position discount covers the pot odds. With 20 big blinds or fewer, a small open is
+answered by expected chips: folding, calling and shoving are each valued, the shove against how often the
+opener folds to one, which starts at the rate of a solved shove-or-not game for that stack and moves with
+each shove the opponent answers (the parent agent shoves every hand in that spot). Postflop, the opponent's range is laid out by
 strength on a 50-cell grid and reweighted by its actions this hand: a bet keeps the top of the range and
 scales the rest by the bluffing rate implied by how often that seat bets, a check does the reverse, and a
 call of the agent's bet removes the hands that would have folded. Equity against the whole range becomes a

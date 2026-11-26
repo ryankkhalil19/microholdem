@@ -1,7 +1,7 @@
 """Heads-up agent with a per-opponent frequency model.
 
 :class:`HeadsUpAgent` plays two-seat tables; with more seats it defers to :class:`MicroAgent`.
-It keeps the parent's preflop opening and defending ranges and changes three things.
+It keeps the parent's preflop opening and defending ranges and changes four things.
 
 Pot odds use only the chips that can be won.
     :func:`callable_view` caps every bet at what the acting seat can match, so a shove that
@@ -11,6 +11,12 @@ A re-raise is answered by price.
     The parent folds almost every hand to a re-raise. Here the re-raiser is given the top slice
     of hands matching how often this opponent has re-raised (:class:`OpponentModel`), and the
     agent continues when ``equity * realisation >= pot odds``.
+
+A short stack answers an open by expected value.
+    With 20 big blinds or fewer the parent prices a reply to a small open as a call of that
+    open and then shoves the whole stack, which shoves every hand. Here folding, calling and
+    shoving are each valued in chips, the shove against how often this opponent has folded its
+    open to one, and the best of the three is played (:meth:`HeadsUpAgent._facing_open_short`).
 
 Postflop decisions condition on the opponent's own frequencies.
     The opponent's range is laid out by strength and reweighted by what it did this hand: a bet
@@ -34,8 +40,8 @@ import numpy as np
 import numpy.typing as npt
 
 from . import _core
-from .agent import MicroAgent
-from .cards import class_index
+from .agent import PUSHFOLD_MAX_BB, MicroAgent
+from .cards import class_combos, class_index
 from .engine import CALL, CHECK, FOLD, Action, ActionKind, Observation, Street
 from .equity import Range
 
@@ -52,6 +58,8 @@ REALISATION_IP = 0.92  # share of preflop equity realised when calling in positi
 REALISATION_OOP = 0.76  # ... and out of position
 RERAISE_EQUITY = 0.60  # re-raise for value at this equity against the raiser's range
 JAM_OVERSIZE_BB = 16.0  # a preflop raise to at least this many big blinds is treated as a shove
+SHOVE_GAME_ROUNDS = 40  # rounds of fictitious play in HeadsUpAgent._shove_game
+COMMITTED = 0.33  # a seat with this share of its stack in the pot does not fold; a call this large is a shove or a fold
 MARGIN_FLOP = 0.04  # extra equity needed to call a flop bet: more bets may follow
 MARGIN_TURN = 0.02
 _BINS = 50  # resolution of the range-strength grid in HeadsUpAgent._standing
@@ -87,6 +95,7 @@ class OpponentModel:
         "bb_jam_deep": (0.03, 12.0),  # shoves over an open with more than 25 big blinds
         "bb_jam_short": (0.15, 8.0),  # shoves over an open with 25 big blinds or fewer
         "fold_to_3bet": (0.50, 6.0),  # folds its open to a re-raise
+        "fold_to_jam": (0.50, 6.0),  # folds its open to a shove; the agent replaces the mean by the price
         "bet": (0.50, 5.0),  # bets postflop when first to act or checked to
         "raise": (0.12, 5.0),  # raises a postflop bet
         "fold_to_bet": (0.42, 5.0),  # folds to a postflop bet or raise
@@ -97,9 +106,10 @@ class OpponentModel:
         self.seen: dict[str, float] = dict.fromkeys(self.PRIORS, 0.0)
         self.hands = 0
 
-    def rate(self, stat: str) -> float:
-        mean, weight = self.PRIORS[stat]
-        return (mean * weight + self.hits[stat]) / (weight + self.seen[stat])
+    def rate(self, stat: str, mean: float | None = None) -> float:
+        """The smoothed frequency; ``mean`` replaces the prior mean when the spot implies a better one."""
+        prior, weight = self.PRIORS[stat]
+        return ((prior if mean is None else mean) * weight + self.hits[stat]) / (weight + self.seen[stat])
 
     def _count(self, stat: str, hit: bool) -> None:
         self.seen[stat] += 1.0
@@ -122,6 +132,8 @@ class OpponentModel:
                 self._count("sb_limp", kind == _CALL)
                 if kind == _RAISE and len(pre) > 2 and pre[1][:2] == (hero, _RAISE):
                     self._count("fold_to_3bet", pre[2][1] == _FOLD)
+                    if pre[1][2] >= shove_size:
+                        self._count("fold_to_jam", pre[2][1] == _FOLD)
             elif seat == hero and button == hero and kind == _RAISE and not jam and len(pre) > 1:
                 _s, reply, reply_amount = pre[1]
                 self._count("bb_fold", reply == _FOLD)
@@ -152,6 +164,10 @@ class HeadsUpAgent(MicroAgent):
         super().__init__(seed, **kwargs)  # type: ignore[arg-type]
         self.model = OpponentModel()
         self._slices: dict[tuple[int, int], tuple[_core.CompiledRange, npt.NDArray[np.float64]]] = {}
+        self._combos = np.array([len(class_combos(c)) for c in range(len(self.tb.rank_hu))], dtype=np.float64)
+        self._cond_equity: npt.NDArray[np.float64] = self.tb.cond * self.tb.class_equity  # row: hero class
+        self._shove_folds: dict[tuple[int, ...], float] = {}
+        self._bands: dict[tuple[int, int], npt.NDArray[np.float64]] = {}
 
     def new_opponent(self) -> None:
         """Forget what was learned; call when the seat across the table changes."""
@@ -218,6 +234,8 @@ class HeadsUpAgent(MicroAgent):
             action = self._postflop_hu(obs, t0)
         elif any(st == 0 and seat == obs.seat and kind == _RAISE for st, seat, kind, _a in obs.history):
             action = self._facing_reraise(obs)
+        elif self._is_short_reply(obs):
+            action = self._facing_open_short(obs)
         else:
             action = self._preflop(obs, t0)
         self.last_latency_ns = time.perf_counter_ns() - t0
@@ -255,12 +273,120 @@ class HeadsUpAgent(MicroAgent):
                 return self._shove(obs)
             action = self._raise_multiple(obs, 2.6 if on_button else 3.3)
             # A raise that puts in a third of the stack leaves no room to fold: shove instead.
-            return self._shove(obs) if action.amount - obs.bet >= 0.33 * obs.stack else action
+            return self._shove(obs) if action.amount - obs.bet >= COMMITTED * obs.stack else action
         if eq * (REALISATION_IP if on_button else REALISATION_OOP) >= need:
-            if obs.to_call >= 0.33 * obs.stack:  # calling commits the stack: shove or fold
+            if obs.to_call >= COMMITTED * obs.stack:  # calling commits the stack: shove or fold
                 return self._shove(obs) if eq >= 0.5 else FOLD
             return CALL
         return FOLD
+
+    # ------------------------------------------------------------------
+    # preflop: a raise we have not answered yet, with a short stack
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_short_reply(obs: Observation) -> bool:
+        """Preflop, facing a raise that is not all-in, at the depth where the parent only shoves or folds."""
+        villain = 1 - obs.seat
+        raised = any(st == 0 and seat == villain and kind == _RAISE for st, seat, kind, _a in obs.history)
+        all_in = obs.stacks[villain] == 0 or obs.to_call >= obs.stack
+        return raised and not all_in and obs.effective_stack <= PUSHFOLD_MAX_BB * obs.big_blind
+
+    def _band(self, lo: float, hi: float) -> npt.NDArray[np.float64]:
+        """Class weights of the hands ranked between the top ``lo`` and the top ``hi`` fraction, to 0.5%."""
+        key = (round(200 * lo), round(200 * hi))
+        found = self._bands.get(key)
+        if found is None:
+            order = [int(x) for x in self.tb.order_hu]
+            top = Range.top_fraction(order, key[1] / 200).weights
+            found = self._bands[key] = np.clip(top - Range.top_fraction(order, key[0] / 200).weights, 0.0, 1.0)
+        return found
+
+    def _reply_values(
+        self, obs: Observation, opens: npt.NDArray[np.float64], callers: npt.NDArray[np.float64]
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """Chips won by shoving and by calling with each of the 169 classes; folding is worth zero.
+
+        ``opens`` is the raiser's range and ``callers`` the part of it that calls a shove, both as
+        class weights. A shove wins the pot when the raiser folds and otherwise plays for both
+        effective stacks; how often it is called, and by what, allows for the cards we hold. A call
+        is worth the hand's equity against the whole range, discounted for playing the hand out,
+        and is not offered when it would commit the stack.
+        """
+        effective = obs.effective_stack
+        risk = effective - obs.bet  # chips a called shove adds to the pot
+        cond = self.tb.cond
+        mass_open = cond @ opens
+        mass_call = cond @ callers
+        p_call = mass_call / mass_open
+        eq_called = np.divide(
+            self._cond_equity @ callers, mass_call, out=np.full_like(mass_call, 0.5), where=mass_call > 0
+        )
+        shove = (1.0 - p_call) * obs.pot + p_call * (eq_called * 2 * effective - risk)
+        call = np.zeros_like(shove)
+        if obs.to_call < COMMITTED * obs.stack:
+            realisation = REALISATION_IP if obs.button == obs.seat else REALISATION_OOP
+            eq_open = (self._cond_equity @ opens) / mass_open
+            call = eq_open * realisation * (obs.pot + obs.to_call) - obs.to_call
+        return shove, call
+
+    def _shove_game(self, obs: Observation, opens: npt.NDArray[np.float64]) -> float:
+        """Share of its opening range the raiser folds to a shove when both sides play the spot well.
+
+        Fictitious play on the zero-sum game left once the open is made: we shove the hands for
+        which :meth:`_reply_values` prefers it, the raiser calls with the hands that have the pot
+        odds against the hands we shove, and each side replies to the other's average so far.
+        """
+        villain = 1 - obs.seat
+        effective = obs.effective_stack
+        need = (effective - obs.bets[villain]) / (2.0 * effective)
+        cond = self.tb.cond
+        shoves = np.full_like(opens, 0.5)
+        callers = opens.copy()
+        for n in range(2, SHOVE_GAME_ROUNDS + 2):
+            shove, call = self._reply_values(obs, opens, callers)
+            mass = cond @ shoves
+            eq_raiser = np.divide(self._cond_equity @ shoves, mass, out=np.full_like(mass, 0.5), where=mass > 0)
+            shoves += ((shove > np.maximum(call, 0.0)) - shoves) / n
+            callers += (opens * (eq_raiser >= need) - callers) / n
+        return 1.0 - float((callers * self._combos).sum() / (opens * self._combos).sum())
+
+    def _fold_to_shove(self, obs: Observation, lo: float, hi: float) -> float:
+        """How often the raiser folds to a shove: the well-played rate, moved by what it has done.
+
+        With no shoves seen this is the fold rate of :meth:`_shove_game`, so a shorter stack,
+        which lays the raiser a better price, is called more often. Each shove this opponent
+        answers moves the rate towards its own frequency.
+        """
+        villain = 1 - obs.seat
+        effective = obs.effective_stack
+        if obs.bets[villain] >= COMMITTED * effective:
+            return 0.0
+        bb = obs.big_blind
+        key = (
+            round(2 * effective / bb),
+            round(4 * obs.bets[villain] / bb),
+            round(100 * lo),
+            round(100 * hi),
+            int(obs.button == obs.seat),
+        )
+        found = self._shove_folds.get(key)
+        if found is None:
+            found = self._shove_folds[key] = self._shove_game(obs, self._band(lo, hi))
+        return self.model.rate("fold_to_jam", mean=found)
+
+    def _facing_open_short(self, obs: Observation) -> Action:
+        """Fold, call or shove against a raise, whichever :meth:`_reply_values` makes worth most.
+
+        The raiser holds its opening range, folds to a shove at the rate of :meth:`_fold_to_shove`
+        and calls with the best of the range.
+        """
+        cls = class_index(obs.hole[0], obs.hole[1])
+        lo, hi = self._villain_slice(obs)
+        fold = self._fold_to_shove(obs, lo, hi)
+        shove, call = self._reply_values(obs, self._band(lo, hi), self._band(lo, lo + (hi - lo) * (1.0 - fold)))
+        if obs.can_raise and shove[cls] > max(call[cls], 0.0):
+            return self._shove(obs)
+        return CALL if call[cls] > 0.0 else FOLD
 
     # ------------------------------------------------------------------
     # postflop

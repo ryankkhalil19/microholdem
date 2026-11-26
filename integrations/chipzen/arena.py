@@ -173,6 +173,7 @@ class Profile:
         bluff_freq: float,
         bet_size: float,
         call_margin: float,
+        jam_call: float = 0.06,
     ) -> None:
         self.name = name
         self.rng = random.Random(seed)
@@ -180,6 +181,7 @@ class Profile:
         self.open_frac, self.limp_frac, self.open_size = open_frac, limp_frac, open_size
         self.threebet_frac, self.jam3_frac, self.defend_frac = threebet_frac, jam3_frac, defend_frac
         self.value_bet, self.bluff_freq, self.bet_size, self.call_margin = value_bet, bluff_freq, bet_size, call_margin
+        self.jam_call = jam_call  # share of hands that call a re-raise for a large part of the stack
 
     def reset(self, seat: int, n_seats: int, seed: int) -> None:
         self.rng = random.Random(seed)
@@ -214,7 +216,7 @@ class Profile:
             if rank <= 0.04 and obs.can_raise:
                 return EngineAction.raise_to(obs.max_raise_to)
             committed = obs.to_call >= 0.4 * obs.stack
-            return CALL if rank <= (0.06 if committed else 0.14) else FOLD
+            return CALL if rank <= (self.jam_call if committed else max(0.14, self.jam_call)) else FOLD
         eq = float(_core.equity_vs_random(list(obs.hole), list(obs.board), 1, 300, self.rng.getrandbits(62)))
         if obs.to_call == 0:
             if obs.can_raise and (eq >= self.value_bet or self.rng.random() < self.bluff_freq):
@@ -226,7 +228,7 @@ class Profile:
         return CALL if eq >= obs.to_call / (obs.pot + obs.to_call) + self.call_margin else FOLD
 
 
-# Frequencies read from the Season 16 replays (6BP9, Phineas-IV) and earlier challenges (glambot).
+# Frequencies read from the Season 16 replays (6BP9, Phineas-IV) and from challenges (glambot, Chatterbox).
 PRESETS: dict[str, dict[str, float]] = {
     "minraiser": dict(open_frac=0.80, limp_frac=0.0, open_size=2.0, threebet_frac=0.05, jam3_frac=0.0,
                       defend_frac=0.95, value_bet=0.58, bluff_freq=0.35, bet_size=0.5, call_margin=0.25),
@@ -236,6 +238,8 @@ PRESETS: dict[str, dict[str, float]] = {
                     defend_frac=1.0, value_bet=0.70, bluff_freq=0.05, bet_size=0.5, call_margin=-0.15),
     "regular": dict(open_frac=0.72, limp_frac=0.0, open_size=2.5, threebet_frac=0.12, jam3_frac=0.0,
                     defend_frac=0.65, value_bet=0.60, bluff_freq=0.25, bet_size=0.66, call_margin=0.04),
+    "sticky": dict(open_frac=0.72, limp_frac=0.28, open_size=2.15, threebet_frac=0.23, jam3_frac=0.08,
+                   defend_frac=1.0, value_bet=0.68, bluff_freq=0.08, bet_size=0.7, call_margin=0.0, jam_call=0.45),
 }  # fmt: skip
 ARCHETYPES = ("oracle", "blitz", "granite", "jammer", "sponge")
 POOL = (*PRESETS, *ARCHETYPES)
