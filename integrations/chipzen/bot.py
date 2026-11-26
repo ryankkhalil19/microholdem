@@ -1,10 +1,12 @@
 """microholdem as a Chipzen bot.
 
-A ``chipzen.Bot`` that plays No-Limit Hold'em with :class:`microholdem.agent.MicroAgent`. Each
+A ``chipzen.Bot`` that plays No-Limit Hold'em with :class:`microholdem.headsup.HeadsUpAgent`, which
+adapts to the opponent at two-seat tables and plays as ``MicroAgent`` at larger ones. Each
 ``turn_request`` is rebuilt into the ``Observation`` microholdem's own engine would give the acting
 seat: per-seat stacks and street bets, who is still in the hand, the blinds and the action history
 are all replayed from the hand's ``action_history`` (Chipzen POKER-GAME-STATE-PROTOCOL sections 3.3
-and 3.4). The agent's action is then mapped onto ``valid_actions``.
+and 3.4). The agent's action is then mapped onto ``valid_actions``, and every finished hand is fed
+back to the agent's opponent model.
 
 Hosted on Chipzen (the platform sets ``CHIPZEN_WS_URL`` and ``CHIPZEN_TOKEN``):  python bot.py
 Remote play from your own machine:                                            chipzen run-external bot.py
@@ -21,10 +23,10 @@ from typing import Any
 from chipzen import Action, Bot, GameState
 from chipzen.client import run_bot
 
-from microholdem.agent import MicroAgent
 from microholdem.cards import parse_card
 from microholdem.engine import Action as AgentAction
 from microholdem.engine import ActionKind, Observation
+from microholdem.headsup import HeadsUpAgent, callable_view
 
 # Chipzen allows 5 s per decision; microholdem was tuned for 1 ms. Some of the slack buys a larger
 # Monte Carlo sample: at most 20,000 samples or 20 ms, a few milliseconds per postflop decision.
@@ -57,9 +59,11 @@ def _int(value: object, default: int = 0) -> int:
 def to_observation(state: GameState, small_blind: int = 0, big_blind: int = 0, ante: int = 0) -> Observation:
     """Rebuild the ``Observation`` microholdem's engine would give the acting seat.
 
-    ``small_blind``, ``big_blind`` and ``ante`` come from ``match_start.game_config``; 0 means
-    unknown, and the hand's blind entries are used instead. Antes are dead money on Chipzen, so
-    they stay out of the street bets.
+    The blinds are read from the hand's own ``post_small_blind`` and ``post_big_blind`` entries,
+    because Chipzen raises them during a match and ``match_start.game_config`` only names the
+    opening level. ``small_blind`` and ``big_blind`` are lower bounds (the last level seen), which
+    matter when a short stack posts less than the blind. Antes are dead money on Chipzen, so they
+    stay out of the street bets.
     """
     n = len(state.opponent_stacks) + 1
     hero = state.your_seat
@@ -106,8 +110,10 @@ def to_observation(state: GameState, small_blind: int = 0, big_blind: int = 0, a
         if rivals:
             bets[max(rivals, key=lambda s: bets[s])] = bets[hero] + state.to_call
 
-    bb = big_blind or posted["post_big_blind"] or max(1, state.min_raise // 2)
-    sb = small_blind or posted["post_small_blind"] or max(1, bb // 2)
+    # A short stack posts less than the blind, so the level is the largest of what was posted,
+    # twice the small blind, and the last level seen. With no blind entries, half the minimum raise.
+    bb = max(big_blind, posted["post_big_blind"], 2 * posted["post_small_blind"]) or max(1, state.min_raise // 2)
+    sb = max(small_blind, posted["post_small_blind"]) or max(1, bb // 2)
     can_raise = "raise" in state.valid_actions
     return Observation(
         seat=hero,
@@ -148,10 +154,10 @@ def to_chipzen(action: AgentAction, obs: Observation, state: GameState) -> Actio
 
 
 class MicroholdemBot(Bot):
-    """microholdem's ``MicroAgent`` behind the Chipzen protocol."""
+    """microholdem's ``HeadsUpAgent`` behind the Chipzen protocol."""
 
     def __init__(self) -> None:
-        self.agent = MicroAgent(
+        self.agent = HeadsUpAgent(
             seed=random.getrandbits(32),
             equity_budget_ns=EQUITY_BUDGET_NS,
             max_samples=MAX_SAMPLES,
@@ -160,6 +166,8 @@ class MicroholdemBot(Bot):
         self.small_blind = 0
         self.big_blind = 0
         self.ante = 0
+        self.seat = -1
+        self.hand_stacks: list[int] = []  # stacks before the blinds, from round_start
 
     def on_match_start(self, match_info: dict[str, Any]) -> None:
         self._configure(match_info)
@@ -174,15 +182,50 @@ class MicroholdemBot(Bot):
         self.small_blind = _int(config.get("small_blind"))
         self.big_blind = _int(config.get("big_blind"))
         self.ante = _int(config.get("ante"))
-        seat = _int(message.get("your_seat"), -1)
+        self.seat = _int(message.get("your_seat"), -1)
         seats = _int(config.get("num_players"))
-        if seat >= 0 and seats >= 2:
-            self.agent.reset(seat, seats, random.getrandbits(32))
+        if self.seat >= 0 and seats >= 2:
+            self.agent.reset(self.seat, seats, random.getrandbits(32))
+
+    def on_round_start(self, message: dict[str, Any]) -> None:
+        state = message.get("state")
+        stacks = state.get("stacks") if isinstance(state, dict) else None
+        self.hand_stacks = [_int(s) for s in stacks] if isinstance(stacks, list) else []
+
+    def on_round_result(self, message: dict[str, Any]) -> None:
+        """Feed the finished hand to the opponent model (two-seat tables only)."""
+        try:
+            result = message.get("result")
+            entries = result.get("action_history") if isinstance(result, dict) else None
+            if not isinstance(entries, list) or len(self.hand_stacks) != 2 or self.seat not in (0, 1):
+                return
+            history: list[tuple[int, int, int, int]] = []
+            button = -1
+            big_blind = self.big_blind
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("action", ""))
+                seat, amount = _int(entry.get("seat"), -1), _int(entry.get("amount"))
+                if name == "post_small_blind":
+                    button = seat  # heads-up, the button posts the small blind
+                    big_blind = max(big_blind, 2 * amount)
+                elif name == "post_big_blind":
+                    big_blind = max(big_blind, amount)
+                elif name in PLAYER_ACTIONS and seat in (0, 1):
+                    history.append((STREETS.get(str(entry.get("phase")), 0), seat, int(PLAYER_ACTIONS[name]), amount))
+            if button in (0, 1):
+                self.agent.observe_hand(history, self.seat, button, big_blind, min(self.hand_stacks))
+        except Exception as exc:  # the model is an aid; never let it break a match
+            print(f"microholdem: {type(exc).__name__}: {exc}; hand not counted", file=sys.stderr)
 
     def decide(self, state: GameState) -> Action:
         try:
             obs = to_observation(state, self.small_blind, self.big_blind, self.ante)
-            return to_chipzen(self.agent.act(obs), obs, state)
+            # Blinds only go up: remember the level for hands where a short stack posts less.
+            self.small_blind, self.big_blind = obs.small_blind, obs.big_blind
+            self.seat = obs.seat
+            return to_chipzen(self.agent.act(callable_view(obs)), obs, state)
         except Exception as exc:  # one malformed state must not cost more than this decision
             print(f"microholdem: {type(exc).__name__}: {exc}; checking or folding", file=sys.stderr)
             return Action.check() if "check" in state.valid_actions else Action.fold()

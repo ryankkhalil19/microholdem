@@ -1,11 +1,64 @@
 # microholdem on Chipzen
 
-`bot.py` runs microholdem's `MicroAgent` as a [Chipzen](https://chipzen.ai) bot, built on the
+`bot.py` runs microholdem as a [Chipzen](https://chipzen.ai) bot, built on the
 [Chipzen SDK](https://github.com/chipzen-ai/chipzen-sdk) (`chipzen-bot` 0.7.0). For every
 `turn_request` it rebuilds the `Observation` microholdem's own engine would produce: per-seat stacks
 and street bets, folds, busted seats, blinds and the action history, all replayed from the hand's
 `action_history`. `test_bot.py` checks that rebuild against every decision point of 400 hands played
 by microholdem's engine at 2 to 6 seats, including short stacks and all-ins.
+
+The agent is `microholdem.headsup.HeadsUpAgent`: at two-seat tables it keeps a frequency model of
+the opponent, fed from every `round_result`, and at larger tables it plays as `MicroAgent`.
+
+## Match format and what the first version got wrong
+
+A Chipzen bot-vs-bot match is a heads-up freezeout: 10,000 chips each, blinds from 50/100 rising
+every 20 hands (75/150, 100/200, 150/300, 200/400, 300/600 seen so far), played until one seat has
+every chip. `match_start.game_config` names only the opening blinds.
+
+The first version of this adapter took the blinds from `match_start` for the whole match. From hand
+21 on it played as if the blinds were still 50/100: it folded its big blind to 78% of small opens
+(24% at the first level), sized opens to the minimum and never reached its push/fold tables. In its
+first 11 matches on the platform it made +252 BB/100 at the first level and +28 BB/100 after it.
+The blinds are now read from each hand's `post_small_blind` and `post_big_blind` entries, as
+Chipzen's `COMMON-PITFALLS.md` section 11 says to.
+
+It also priced calls against a covering all-in on the whole shove, not on the part it could call,
+and so called off too light. `microholdem.headsup.callable_view` fixes that.
+
+## Measured against the deployed version
+
+`arena.py` plays this format locally: microholdem's engine deals, and each `chipzen.Bot` gets the
+`match_start`, `turn_request` and `round_result` payloads the platform sends. Matches are mirrored
+pairs (same seed, seats swapped) with a fixed 600-sample Monte Carlo, so a run depends only on the
+seed. `v1` is the adapter as first uploaded (`git show b5420dd:integrations/chipzen/bot.py`).
+
+| Opponent | v1 (deployed) | This version | Matches each |
+|---|---:|---:|---:|
+| v1, head to head | | 67.2% (95% CI 65.1 to 69.2) | 2,000 |
+| v1 with only the two fixes above, head to head | | 56.5% (54.3 to 58.6) | 2,000 |
+| minraiser (opens 80% for the minimum, bets half the time; after 6BP9) | 41.3% | 64.8% | 1,000 |
+| barreler (opens or limps 96%, re-raises 19%, shoves 8%; after Phineas-IV) | 59.9% | 67.7% | 1,000 |
+| station (limps everything, rarely folds; after glambot) | 78.4% | 96.2% | 1,000 |
+| regular (opens 72%, re-raises 12%) | 62.9% | 77.9% | 1,000 |
+| oracle, granite, jammer, sponge (microholdem archetypes) | 69.3, 87.2, 67.3, 70.3% | 90.6, 89.5, 78.8, 94.7% | 1,000 |
+| blitz (raises most hands, shoves 15% of its raises) | 62.6% | 57.7% | 1,000 |
+| All nine pool opponents | 66.6% | 79.8% | 9,000 |
+
+Reproduce (about 12 minutes on eight cores):
+
+```bash
+git show b5420dd:integrations/chipzen/bot.py > /tmp/bot_v1.py
+python arena.py --a bot.py --b /tmp/bot_v1.py --matches 2000
+python arena.py --a bot.py --pool --matches 1000
+python arena.py --a /tmp/bot_v1.py --pool --matches 1000
+```
+
+What this does and does not show. The pool opponents are simple bots written for this benchmark,
+four of them shaped on frequencies read from replays; they are not the bots on the platform, and a
+win rate against them is not a forecast of a ladder rating. The version is worse against blitz,
+the one opponent that raises and shoves almost at random. The head-to-head result is the firm one:
+the same engine, the same seeds, and only the adapter and agent changed.
 
 ## Differences from microholdem's own engine
 
@@ -33,10 +86,10 @@ server. It does not measure strength; ratings come from matches on the platform.
 Needs a Docker engine. From the repository root:
 
 ```bash
-docker build --platform=linux/amd64 -f integrations/chipzen/Dockerfile -t microholdem-chipzen:1 .
-docker run --rm --platform=linux/amd64 --entrypoint id microholdem-chipzen:1   # must not print uid=0
-docker image ls microholdem-chipzen:1                                           # image limit: 200 MB
-docker save microholdem-chipzen:1 | gzip > integrations/chipzen/microholdem-chipzen.tar.gz  # upload limit: 250 MB; git-ignored
+docker build --platform=linux/amd64 -f integrations/chipzen/Dockerfile -t microholdem-chipzen:2 .
+docker run --rm --platform=linux/amd64 --entrypoint id microholdem-chipzen:2   # must not print uid=0
+docker image ls microholdem-chipzen:2                                           # image limit: 200 MB
+docker save microholdem-chipzen:2 | gzip > integrations/chipzen/microholdem-chipzen-v2.tar.gz  # upload limit: 250 MB; git-ignored
 ```
 
 Upload the tarball in the Chipzen developer UI. Review plays a short scripted match and activates the
@@ -58,7 +111,9 @@ No Docker needed, but the machine must stay online while matches run.
 
 3. Run `chipzen run-external bot.py`.
 
-## Not yet verified
+## Notes
 
-- The hosted image has not been built or run here. If it fails at startup, the usual cause is the
-  platform's seccomp profile blocking a syscall that a native extension needs (Chipzen DEV-MANUAL §7.4).
+- An uploaded image cannot be replaced: uploading a new tarball creates a new bot, and a season
+  entry stays with the bot that was registered.
+- The first image passed the platform's review and played its matches there, so the C++ extension
+  runs under the platform's seccomp profile.

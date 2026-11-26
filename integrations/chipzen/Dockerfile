@@ -2,8 +2,8 @@
 #
 # microholdem as a Chipzen bot. Build from the repository root, for the platform's linux/amd64:
 #
-#   docker build --platform=linux/amd64 -f integrations/chipzen/Dockerfile -t microholdem-chipzen:1 .
-#   docker save microholdem-chipzen:1 | gzip > integrations/chipzen/microholdem-chipzen.tar.gz
+#   docker build --platform=linux/amd64 -f integrations/chipzen/Dockerfile -t microholdem-chipzen:2 .
+#   docker save microholdem-chipzen:2 | gzip > integrations/chipzen/microholdem-chipzen-v2.tar.gz
 #
 # Stage 1 compiles microholdem's C++ extension into a wheel; stage 2 installs that wheel and the
 # Chipzen SDK and runs bot.py as a non-root user. The platform adds a read-only root filesystem,

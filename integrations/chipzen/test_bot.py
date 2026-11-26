@@ -308,3 +308,77 @@ def test_every_engine_observation_survives_the_round_trip() -> None:
                 assert to_observation(as_chipzen_state(obs, blinds), sb, bb, 0) == obs
                 checked += 1
     assert checked > 1500
+
+
+# ----------------------------------------------------------------------------
+# Blind levels, the opponent model and the local arena
+# ----------------------------------------------------------------------------
+MATCH_START = {"your_seat": 0, "game_config": {"small_blind": 50, "big_blind": 100, "ante": 0, "num_players": 2}}
+
+
+def level_state(sb_post: int, bb_post: int, stacks: list[int]) -> GameState:
+    history = [entry(0, "post_small_blind", sb_post), entry(1, "post_big_blind", bb_post)]
+    return turn_request(
+        seat=0, dealer=0, phase="preflop", board=[], hole=["As", "Kh"], pot=sb_post + bb_post, stacks=stacks,
+        to_call=300 - sb_post, min_raise=600, max_raise=stacks[0] + sb_post, valid=["fold", "call", "raise"],
+        history=history,
+    )  # fmt: skip
+
+
+def test_blinds_follow_the_hand_after_the_level_rises() -> None:
+    # match_start named 50/100, but Chipzen raises the blinds every 20 hands: this hand posts 150/300.
+    obs = to_observation(level_state(150, 300, [9_850, 9_700]), 50, 100, 0)
+    assert (obs.small_blind, obs.big_blind) == (150, 300)
+    assert obs.effective_stack / obs.big_blind == pytest.approx(10_000 / 300)
+
+
+def test_bot_keeps_the_level_when_a_short_stack_posts_less() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.decide(level_state(150, 300, [9_850, 9_700]))
+    assert (bot.small_blind, bot.big_blind) == (150, 300)
+    # Next hand the big blind is all-in for 120: the level is still 150/300.
+    obs = to_observation(level_state(150, 120, [19_730, 0]), bot.small_blind, bot.big_blind, 0)
+    assert obs.big_blind == 300
+
+
+def test_finished_hands_reach_the_opponent_model() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    prior = bot.agent.model.rate("sb_open")
+    for hand in range(1, 11):  # the opponent (seat 1) opens its button ten times; we fold
+        bot.on_round_start({"round_number": hand, "state": {"hand_number": hand, "stacks": [10_000, 10_000]}})
+        history = [
+            entry(1, "post_small_blind", 50),
+            entry(0, "post_big_blind", 100),
+            entry(1, "raise", 250),
+            entry(0, "fold", 0),
+        ]
+        bot.on_round_result({"result": {"hand_number": hand, "action_history": history}})
+    assert bot.agent.model.hands == 10
+    assert bot.agent.model.rate("sb_open") > prior + 0.1
+
+
+@pytest.mark.parametrize(
+    "message", [{}, {"result": None}, {"result": {"action_history": "x"}}, {"result": {"action_history": [None, 7]}}]
+)
+def test_a_malformed_round_result_is_ignored(message: dict[str, Any]) -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.on_round_start({"state": {"stacks": [10_000, 10_000]}})
+    bot.on_round_result(message)
+    assert bot.agent.model.hands == 0
+
+
+def test_arena_plays_the_chipzen_format_to_a_winner() -> None:
+    from arena import ChipzenSeat, blinds_for_hand, make_opponent, play_match
+
+    assert [blinds_for_hand(h) for h in (0, 19, 20, 100)] == [(50, 100), (50, 100), (75, 150), (300, 600)]
+    bot = MicroholdemBot()
+    bot.agent.samples = 64
+    result = play_match([ChipzenSeat(bot), make_opponent("minraiser", 3)], seed=5)
+    assert result.winner in (0, 1)
+    assert result.illegal == (0, 0)
+    assert bot.agent.model.hands == result.hands
+    # The bot saw the blinds rise: it is within one level of where the match ended.
+    assert bot.big_blind >= blinds_for_hand(max(0, result.hands - 21))[1]

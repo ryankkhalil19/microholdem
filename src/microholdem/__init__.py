@@ -9,6 +9,7 @@ Components
 - :mod:`microholdem.rivercfr`   vanilla CFR for a bucketed river betting game
 - :mod:`microholdem.tables`     precomputed tables shipped with the package
 - :mod:`microholdem.agent`      the sub-millisecond decision agent
+- :mod:`microholdem.headsup`    heads-up agent with a per-opponent frequency model
 - :mod:`microholdem.engine`     NLHE hand engine (side pots, blind levels, SNG rules)
 - :mod:`microholdem.archetypes` opponent bots used by the simulator
 - :mod:`microholdem.simulate`   tournament simulator (8-max SNG, heads-up duel)

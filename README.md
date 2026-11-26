@@ -99,7 +99,7 @@ it is why the agent's result is reported as points and table wins rather than as
 ```bash
 git clone https://github.com/ryankkhalil19/microholdem && cd microholdem
 python -m pip install -e ".[dev]"          # builds the C++ extension (needs a C++17 compiler)
-pytest -q                                   # 66 tests, about 8 s, includes the exhaustive 7-card census
+pytest -q                                   # 84 tests, about 10 s, includes the exhaustive 7-card census
 ruff check src tests && mypy               # lint and strict type check (package and tests)
 python -m microholdem.bench --out bench    # full benchmark, about 15 s
 python -m microholdem.simulate sng --tables 100 --lineup micro,granite,blitz,sponge,oracle,jammer,scatter,passenger
@@ -163,6 +163,22 @@ line, with the sample count chosen from the remaining time budget; heads-up rive
 strategy (check-raise and bluff mixes by bucket), everything else from pot-odds thresholds with street margins
 and an ICM risk premium on stack-committing calls.
 
+### Heads-up agent
+
+`headsup.HeadsUpAgent` extends the agent for two-seat tables and defers to it at larger ones. It keeps
+`OpponentModel`, ten smoothed frequencies of the seat across the table (opens, limps, re-raises, shoves,
+postflop bets, raises and folds), updated once per finished hand. Pot odds are taken on the chips the agent
+can actually win (`callable_view` caps a covering shove at the callable part). A re-raise is answered by
+price: the re-raiser gets the top slice of hands matching how often it has re-raised, and the agent continues
+when equity times a position discount covers the pot odds. Postflop, the opponent's range is laid out by
+strength on a 50-cell grid and reweighted by its actions this hand: a bet keeps the top of the range and
+scales the rest by the bluffing rate implied by how often that seat bets, a check does the reverse, and a
+call of the agent's bet removes the hands that would have folded. Equity against the whole range becomes a
+win probability against the reweighted range, which is what is compared with the pot odds; value bets and
+bluffs are chosen from how often the opponent has folded. It is the agent behind the Chipzen integration,
+and [integrations/chipzen/README.md](integrations/chipzen/README.md) has its results in that platform's
+heads-up format against the previous version. It is an exploitative model, not an equilibrium strategy.
+
 ### Simulator
 
 `engine.play_hand` plays one hand for 2 to 10 seats: blinds and antes, full-raise and short all-in semantics
@@ -193,8 +209,9 @@ the organizers.
 - The 169x169 class equity matrix is Monte Carlo (40,000 deals per pair, standard error about 0.25%), not exact.
 - The abstractions ignore card removal between callers and blockers; the river model assumes independent
   uniform strengths.
-- Opponent ranges are inferred from preflop lines with fixed fractions; there is no Bayesian updating from
-  postflop actions beyond a tightening factor.
+- `MicroAgent` infers opponent ranges from preflop lines with fixed fractions, with no updating from postflop
+  actions beyond a tightening factor. `HeadsUpAgent` reweights by postflop actions, but on a strength grid
+  indexed by equity, which treats a draw and a made hand of equal equity alike.
 - The simulator is pure Python; the C++ core only covers evaluation, sampling and ICM.
 - Benchmarks are single-machine numbers; the tournament hardware is unknown, so the agent keeps a wide margin
   below the limit rather than filling it.
