@@ -16,7 +16,7 @@ from chipzen import GameState
 
 from microholdem.agent import MicroAgent
 from microholdem.archetypes import make_archetype
-from microholdem.cards import card_str
+from microholdem.cards import card_str, parse_cards
 from microholdem.engine import CALL, CHECK, FOLD, ActionKind, HandConfig, Observation, play_hand
 from microholdem.engine import Action as AgentAction
 from microholdem.engine import Bot as EngineBot
@@ -308,3 +308,122 @@ def test_every_engine_observation_survives_the_round_trip() -> None:
                 assert to_observation(as_chipzen_state(obs, blinds), sb, bb, 0) == obs
                 checked += 1
     assert checked > 1500
+
+
+# ----------------------------------------------------------------------------
+# Blind levels, the opponent model and the local arena
+# ----------------------------------------------------------------------------
+MATCH_START = {"your_seat": 0, "game_config": {"small_blind": 50, "big_blind": 100, "ante": 0, "num_players": 2}}
+
+
+def level_state(sb_post: int, bb_post: int, stacks: list[int]) -> GameState:
+    history = [entry(0, "post_small_blind", sb_post), entry(1, "post_big_blind", bb_post)]
+    return turn_request(
+        seat=0, dealer=0, phase="preflop", board=[], hole=["As", "Kh"], pot=sb_post + bb_post, stacks=stacks,
+        to_call=300 - sb_post, min_raise=600, max_raise=stacks[0] + sb_post, valid=["fold", "call", "raise"],
+        history=history,
+    )  # fmt: skip
+
+
+def test_blinds_follow_the_hand_after_the_level_rises() -> None:
+    # match_start named 50/100, but Chipzen raises the blinds every 20 hands: this hand posts 150/300.
+    obs = to_observation(level_state(150, 300, [9_850, 9_700]), 50, 100, 0)
+    assert (obs.small_blind, obs.big_blind) == (150, 300)
+    assert obs.effective_stack / obs.big_blind == pytest.approx(10_000 / 300)
+
+
+def test_bot_keeps_the_level_when_a_short_stack_posts_less() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.decide(level_state(150, 300, [9_850, 9_700]))
+    assert (bot.small_blind, bot.big_blind) == (150, 300)
+    # Next hand the big blind is all-in for 120: the level is still 150/300.
+    obs = to_observation(level_state(150, 120, [19_730, 0]), bot.small_blind, bot.big_blind, 0)
+    assert obs.big_blind == 300
+
+
+def test_finished_hands_reach_the_opponent_model() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    prior = bot.agent.model.rate("sb_open")
+    for hand in range(1, 11):  # the opponent (seat 1) opens its button ten times; we fold
+        bot.on_round_start({"round_number": hand, "state": {"hand_number": hand, "stacks": [10_000, 10_000]}})
+        history = [
+            entry(1, "post_small_blind", 50),
+            entry(0, "post_big_blind", 100),
+            entry(1, "raise", 250),
+            entry(0, "fold", 0),
+        ]
+        bot.on_round_result({"result": {"hand_number": hand, "action_history": history}})
+    assert bot.agent.model.hands == 10
+    assert bot.agent.model.rate("sb_open") > prior + 0.1
+
+
+@pytest.mark.parametrize(
+    "message", [{}, {"result": None}, {"result": {"action_history": "x"}}, {"result": {"action_history": [None, 7]}}]
+)
+def test_a_malformed_round_result_is_ignored(message: dict[str, Any]) -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.on_round_start({"state": {"stacks": [10_000, 10_000]}})
+    bot.on_round_result(message)
+    assert bot.agent.model.hands == 0
+
+
+def test_a_new_match_clears_the_opponent_model_and_a_reconnect_keeps_it() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.on_round_start({"state": {"stacks": [10_000, 10_000]}})
+    history = [
+        entry(1, "post_small_blind", 50),
+        entry(0, "post_big_blind", 100),
+        entry(1, "raise", 250),
+        entry(0, "fold", 0),
+    ]
+    bot.on_round_result({"result": {"action_history": history}})
+    assert bot.agent.model.hands == 1
+    bot.on_reconnected(MATCH_START)  # same match, same opponent
+    assert bot.agent.model.hands == 1
+    bot.on_match_start(MATCH_START)  # the instance is reused for another match
+    assert bot.agent.model.hands == 0
+
+
+def test_arena_matches_depend_only_on_the_seed() -> None:
+    from arena import _pair, make_seat, play_match
+
+    def match(seed: int) -> tuple[int, int]:
+        result = play_match([make_seat("bot.py", 11, 64), make_seat("barreler", 12, 64)], seed)
+        return result.winner, result.hands
+
+    assert match(7) == match(7)
+    assert _pair(("bot.py", "minraiser", 3, 64)) == _pair(("bot.py", "minraiser", 3, 64))
+    assert len({match(seed) for seed in range(4)}) > 1  # different seeds, different matches
+
+
+def test_arena_plays_the_chipzen_format_to_a_winner() -> None:
+    from arena import ChipzenSeat, blinds_for_hand, make_opponent, play_match
+
+    assert [blinds_for_hand(h) for h in (0, 19, 20, 100)] == [(50, 100), (50, 100), (75, 150), (300, 600)]
+    bot = MicroholdemBot()
+    bot.agent.samples = 64
+    result = play_match([ChipzenSeat(bot), make_opponent("minraiser", 3)], seed=5)
+    assert result.winner in (0, 1)
+    assert result.illegal == (0, 0)
+    assert bot.agent.model.hands == result.hands
+    # The bot saw the blinds rise: it is within one level of where the match ended.
+    assert bot.big_blind >= blinds_for_hand(max(0, result.hands - 21))[1]
+
+
+def test_pool_opponents_differ_in_how_they_answer_a_shove() -> None:
+    from arena import make_opponent
+
+    # The button opened to 645 at 150/300 and the big blind shoved 5,700: Chatterbox called this with king-eight.
+    hole = parse_cards("Kh 8s")
+    shoved = Observation(
+        seat=0, hole=(hole[0], hole[1]), board=(), street=0, pot=6_345, to_call=5_055, min_raise_to=10_755,
+        max_raise_to=14_300, can_raise=True, stacks=(13_655, 0), bets=(645, 5_700), in_hand=(True, True), button=0,
+        small_blind=150, big_blind=300, ante=0, n_in_hand=2, hand_number=71,
+        history=((0, 0, int(ActionKind.RAISE), 645), (0, 1, int(ActionKind.RAISE), 5_700)), payouts=(),
+    )  # fmt: skip
+    assert make_opponent("sticky", 1).act(shoved) == CALL
+    assert make_opponent("regular", 1).act(shoved) == FOLD
