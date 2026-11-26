@@ -63,9 +63,10 @@ def _entry(seat: int, action: str, amount: int, phase: str = "preflop") -> dict[
 class ChipzenSeat:
     """Seats a ``chipzen.Bot`` at microholdem's engine, speaking the Chipzen payloads to it."""
 
-    def __init__(self, bot: ChipzenBot, name: str = "") -> None:
+    def __init__(self, bot: ChipzenBot, name: str = "", agent_seed: int | None = None) -> None:
         self.bot = bot
         self.name = name or type(bot).__name__
+        self.agent_seed = agent_seed  # when set, the bot's agent draws from this seed in every match
         self.seat = -1
         self.blinds: list[dict[str, Any]] = []
         self.illegal = 0
@@ -87,6 +88,10 @@ class ChipzenSeat:
                 },
             }
         )
+        agent = getattr(self.bot, "agent", None)
+        if self.agent_seed is not None and agent is not None:
+            # match_start reseeds the bot's agent from the system RNG; a seeded run overrides that.
+            agent.rng = random.Random(self.agent_seed)
 
     def start_hand(self, hand_number: int, button: int, stacks: list[int], blinds: list[dict[str, Any]]) -> None:
         self.blinds = blinds
@@ -307,7 +312,7 @@ def make_seat(spec: str, seed: int, samples: int) -> EngineBot:
         # A fixed Monte Carlo sample makes a match depend only on its seed and keeps runs fast.
         agent.samples = samples
         agent.max_samples = max(agent.max_samples, samples)
-        agent.rng = random.Random(seed)
+        return ChipzenSeat(bot, os.path.basename(spec), agent_seed=seed)
     return ChipzenSeat(bot, os.path.basename(spec))
 
 

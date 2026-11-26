@@ -370,6 +370,36 @@ def test_a_malformed_round_result_is_ignored(message: dict[str, Any]) -> None:
     assert bot.agent.model.hands == 0
 
 
+def test_a_new_match_clears_the_opponent_model_and_a_reconnect_keeps_it() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    bot.on_round_start({"state": {"stacks": [10_000, 10_000]}})
+    history = [
+        entry(1, "post_small_blind", 50),
+        entry(0, "post_big_blind", 100),
+        entry(1, "raise", 250),
+        entry(0, "fold", 0),
+    ]
+    bot.on_round_result({"result": {"action_history": history}})
+    assert bot.agent.model.hands == 1
+    bot.on_reconnected(MATCH_START)  # same match, same opponent
+    assert bot.agent.model.hands == 1
+    bot.on_match_start(MATCH_START)  # the instance is reused for another match
+    assert bot.agent.model.hands == 0
+
+
+def test_arena_matches_depend_only_on_the_seed() -> None:
+    from arena import _pair, make_seat, play_match
+
+    def match(seed: int) -> tuple[int, int]:
+        result = play_match([make_seat("bot.py", 11, 64), make_seat("barreler", 12, 64)], seed)
+        return result.winner, result.hands
+
+    assert match(7) == match(7)
+    assert _pair(("bot.py", "minraiser", 3, 64)) == _pair(("bot.py", "minraiser", 3, 64))
+    assert len({match(seed) for seed in range(4)}) > 1  # different seeds, different matches
+
+
 def test_arena_plays_the_chipzen_format_to_a_winner() -> None:
     from arena import ChipzenSeat, blinds_for_hand, make_opponent, play_match
 

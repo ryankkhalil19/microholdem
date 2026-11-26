@@ -30,20 +30,20 @@ and so called off too light. `microholdem.headsup.callable_view` fixes that.
 
 `arena.py` plays this format locally: microholdem's engine deals, and each `chipzen.Bot` gets the
 `match_start`, `turn_request` and `round_result` payloads the platform sends. Matches are mirrored
-pairs (same seed, seats swapped) with a fixed 600-sample Monte Carlo, so a run depends only on the
-seed. `v1` is the adapter as first uploaded (`git show b5420dd:integrations/chipzen/bot.py`).
+pairs (same seed, seats swapped) with a fixed 600-sample Monte Carlo and seeded agents, so a run
+depends only on the seed and repeats exactly. `v1` is the adapter as first uploaded (`git show b5420dd:integrations/chipzen/bot.py`).
 
 | Opponent | v1 (deployed) | This version | Matches each |
 |---|---:|---:|---:|
-| v1, head to head | | 67.2% (95% CI 65.1 to 69.2) | 2,000 |
-| v1 with only the two fixes above, head to head | | 56.5% (54.3 to 58.6) | 2,000 |
-| minraiser (opens 80% for the minimum, bets half the time; after 6BP9) | 41.3% | 64.8% | 1,000 |
-| barreler (opens or limps 96%, re-raises 19%, shoves 8%; after Phineas-IV) | 59.9% | 67.7% | 1,000 |
-| station (limps everything, rarely folds; after glambot) | 78.4% | 96.2% | 1,000 |
-| regular (opens 72%, re-raises 12%) | 62.9% | 77.9% | 1,000 |
-| oracle, granite, jammer, sponge (microholdem archetypes) | 69.3, 87.2, 67.3, 70.3% | 90.6, 89.5, 78.8, 94.7% | 1,000 |
-| blitz (raises most hands, shoves 15% of its raises) | 62.6% | 57.7% | 1,000 |
-| All nine pool opponents | 66.6% | 79.8% | 9,000 |
+| v1, head to head | | 69.1% (95% CI 67.0 to 71.1) | 2,000 |
+| v1 with only the two fixes above, head to head | | 56.8% (54.6 to 59.0) | 2,000 |
+| minraiser (opens 80% for the minimum, bets half the time; after 6BP9) | 42.7% | 61.9% | 1,000 |
+| barreler (opens or limps 96%, re-raises 19%, shoves 8%; after Phineas-IV) | 59.4% | 68.9% | 1,000 |
+| station (limps everything, rarely folds; after glambot) | 77.2% | 96.6% | 1,000 |
+| regular (opens 72%, re-raises 12%) | 64.2% | 77.1% | 1,000 |
+| oracle, granite, jammer, sponge (microholdem archetypes) | 68.6, 86.4, 65.6, 71.1% | 90.7, 90.9, 78.8, 94.3% | 1,000 |
+| blitz (raises most hands, shoves 15% of its raises) | 63.9% | 57.1% | 1,000 |
+| All nine pool opponents | 66.6% | 79.6% | 9,000 |
 
 Reproduce (about 12 minutes on eight cores):
 

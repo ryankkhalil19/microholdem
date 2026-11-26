@@ -170,10 +170,14 @@ class MicroholdemBot(Bot):
         self.hand_stacks: list[int] = []  # stacks before the blinds, from round_start
 
     def on_match_start(self, match_info: dict[str, Any]) -> None:
+        # A new match is a new opponent: what was learned about the last one does not carry over.
+        self.agent.new_opponent()
+        self.hand_stacks = []
         self._configure(match_info)
 
     def on_reconnected(self, message: dict[str, Any]) -> None:
         # A re-attached session gets ``reconnected`` instead of ``match_start``, same game_config.
+        # It is the same match and opponent, so the model is kept.
         self._configure(message)
 
     def _configure(self, message: dict[str, Any]) -> None:
