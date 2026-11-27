@@ -10,6 +10,13 @@ Compare two bot files (each defines one ``chipzen.Bot`` subclass) over mirrored 
 
     python arena.py --a bot.py --b /path/to/older_bot.py --matches 2000
     python arena.py --a bot.py --pool --matches 500          # against the built-in opponents
+
+A match is won or lost on a few large pots, so match counts separate two close versions slowly.
+``--chips`` measures chips per hand instead: sessions of 120 hands, 20 at each of the first six
+blind levels, with both stacks back at 10,000 before every hand, played twice with the seats
+swapped. Every bot gets the same cards, so ``--base`` reports a paired difference:
+
+    python arena.py --a bot.py --base /path/to/older_bot.py --pool --chips 300
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from microholdem.tables import tables
 
 STARTING_STACK = 10_000
 HANDS_PER_LEVEL = 20
+CHIP_LEVELS = 6  # blind levels played in a --chips session: 100 down to 17 big blinds deep
 # The first six levels are the ones seen in Chipzen replays; later levels continue the pattern.
 BLIND_LEVELS: tuple[tuple[int, int], ...] = (
     (50, 100), (75, 150), (100, 200), (150, 300), (200, 400), (300, 600),
@@ -240,6 +248,11 @@ PRESETS: dict[str, dict[str, float]] = {
                     defend_frac=0.65, value_bet=0.60, bluff_freq=0.25, bet_size=0.66, call_margin=0.04),
     "sticky": dict(open_frac=0.72, limp_frac=0.28, open_size=2.15, threebet_frac=0.23, jam3_frac=0.08,
                    defend_frac=1.0, value_bet=0.68, bluff_freq=0.08, bet_size=0.7, call_margin=0.0, jam_call=0.45),
+    # Two seats that seldom bet, and bet the pot: one only with a strong hand, one mostly without.
+    "honest": dict(open_frac=0.72, limp_frac=0.28, open_size=2.15, threebet_frac=0.12, jam3_frac=0.0,
+                   defend_frac=1.0, value_bet=0.70, bluff_freq=0.0, bet_size=1.0, call_margin=0.0, jam_call=0.30),
+    "bully": dict(open_frac=0.72, limp_frac=0.28, open_size=2.15, threebet_frac=0.12, jam3_frac=0.0,
+                  defend_frac=1.0, value_bet=0.88, bluff_freq=0.22, bet_size=1.0, call_margin=0.0, jam_call=0.30),
 }  # fmt: skip
 ARCHETYPES = ("oracle", "blitz", "granite", "jammer", "sponge")
 POOL = (*PRESETS, *ARCHETYPES)
@@ -335,6 +348,71 @@ def _pair(job: tuple[str, str, int, int]) -> tuple[int, int, int, int]:
     return wins, 2, hands, illegal
 
 
+def play_session(bots: list[EngineBot], seed: int) -> list[float]:
+    """Big blinds won by each seat over one ``--chips`` session; each hand's cards depend only on ``seed``."""
+    for i, b in enumerate(bots):
+        b.reset(i, 2, seed + i)
+    won = [0.0, 0.0]
+    for hand in range(HANDS_PER_LEVEL * CHIP_LEVELS):
+        sb, bb = blinds_for_hand(hand)
+        button = hand % 2
+        stacks = [STARTING_STACK, STARTING_STACK]
+        blinds = [_entry(button, "post_small_blind", sb), _entry(1 - button, "post_big_blind", bb)]
+        for b in bots:
+            if isinstance(b, ChipzenSeat):
+                b.start_hand(hand + 1, button, stacks, blinds)
+        cfg = HandConfig(small_blind=sb, big_blind=bb, time_limit_ns=10**12, record_latency=False)
+        result = play_hand(bots, stacks, button, cfg, random.Random(seed * 1000 + hand), hand + 1)
+        for b in bots:
+            if isinstance(b, ChipzenSeat):
+                b.end_hand(result)
+        for seat in (0, 1):
+            won[seat] += (stacks[seat] - STARTING_STACK) / bb
+    return won
+
+
+def _session_pair(job: tuple[str, str, int, int]) -> float:
+    """One session played from both seats. Returns a's big blinds won per 100 hands."""
+    a, b, seed, samples = job
+    total = 0.0
+    for a_seat in (0, 1):
+        bots: list[EngineBot] = [make_seat(a, seed * 2 + 1, samples), make_seat(b, seed * 2 + 2, samples)]
+        if a_seat == 1:
+            bots.reverse()
+        total += play_session(bots, seed)[a_seat]
+    return 100.0 * total / (2 * HANDS_PER_LEVEL * CHIP_LEVELS)
+
+
+def mean_and_error(values: list[float]) -> tuple[float, float]:
+    """The mean and its standard error."""
+    n = len(values)
+    mean = sum(values) / n
+    return mean, math.sqrt(sum((v - mean) ** 2 for v in values) / max(1, n - 1) / n)
+
+
+def run_chips(bots: list[str], opponents: list[str], sessions: int, samples: int, seed: int, workers: int) -> None:
+    """Print big blinds per 100 hands for ``bots[0]``, and for any further bot its difference on the same deals."""
+
+    def report(label: str, rows: list[list[float]]) -> None:
+        line = "{:>12.1f} ± {:<5.1f}".format(*mean_and_error(rows[0]))
+        for row in rows[1:]:
+            gain = [x - y for x, y in zip(row, rows[0], strict=True)]
+            line += "{:>+20.1f} ± {:<5.1f}".format(*mean_and_error(gain))
+        print(f"{label:<16}{line}")
+
+    head = "".join(f"{os.path.basename(b) + ' minus first':>28}" for b in bots[1:])
+    print(f"{'BB/100 against':<16}{os.path.basename(bots[0]):>20}{head}    (mean, standard error)")
+    table: list[list[list[float]]] = []
+    with multiprocessing.Pool(workers) as pool:
+        for opp in opponents:
+            jobs = [[(b, opp, seed + i, samples) for i in range(sessions)] for b in bots]
+            table.append([pool.map(_session_pair, batch) for batch in jobs])
+            report(opp, table[-1])
+    if len(opponents) > 1:
+        pooled = [[sum(rows[k][i] for rows in table) / len(table) for i in range(sessions)] for k in range(len(bots))]
+        report("all", pooled)
+
+
 def wilson(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     if n == 0:
         return 0.0, 1.0
@@ -369,6 +447,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--b", action="append", default=[], help="opponent: a bot file or a pool name (repeatable)")
     ap.add_argument("--pool", action="store_true", help=f"also play every built-in opponent: {', '.join(POOL)}")
     ap.add_argument("--matches", type=int, default=1000, help="matches per opponent (played as mirrored pairs)")
+    ap.add_argument("--chips", type=int, default=0, help="play this many fixed-stack sessions per opponent instead")
+    ap.add_argument("--base", action="append", default=[], help="with --chips: a bot file to compare with --a")
     ap.add_argument(
         "--samples", type=int, default=600, help="fixed Monte Carlo samples per decision (0: the bot's own budget)"
     )
@@ -378,6 +458,9 @@ def main(argv: list[str] | None = None) -> int:
     opponents = [*args.b, *(POOL if args.pool else ())]
     if not opponents:
         ap.error("give --b or --pool")
+    if args.chips:
+        run_chips([*args.base, args.a], opponents, args.chips, args.samples, args.seed, args.workers)
+        return 0
     total_w = total_n = 0
     for opp in opponents:
         r = run(args.a, opp, args.matches, args.samples, args.seed, args.workers)

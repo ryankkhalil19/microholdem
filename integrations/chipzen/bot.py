@@ -168,6 +168,7 @@ class MicroholdemBot(Bot):
         self.ante = 0
         self.seat = -1
         self.hand_stacks: list[int] = []  # stacks before the blinds, from round_start
+        self.hand_cards: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())  # our hole cards and the board last seen
 
     def on_match_start(self, match_info: dict[str, Any]) -> None:
         # A new match is a new opponent: what was learned about the last one does not carry over.
@@ -195,6 +196,7 @@ class MicroholdemBot(Bot):
         state = message.get("state")
         stacks = state.get("stacks") if isinstance(state, dict) else None
         self.hand_stacks = [_int(s) for s in stacks] if isinstance(stacks, list) else []
+        self.hand_cards = ((), ())
 
     def on_round_result(self, message: dict[str, Any]) -> None:
         """Feed the finished hand to the opponent model (two-seat tables only)."""
@@ -219,9 +221,21 @@ class MicroholdemBot(Bot):
                 elif name in PLAYER_ACTIONS and seat in (0, 1):
                     history.append((STREETS.get(str(entry.get("phase")), 0), seat, int(PLAYER_ACTIONS[name]), amount))
             if button in (0, 1):
-                self.agent.observe_hand(history, self.seat, button, big_blind, min(self.hand_stacks))
+                hole, board = self.hand_cards
+                stack = min(self.hand_stacks)
+                self.agent.observe_hand(history, self.seat, button, big_blind, stack, hole, board, self._shown(result))
         except Exception as exc:  # the model is an aid; never let it break a match
             print(f"microholdem: {type(exc).__name__}: {exc}; hand not counted", file=sys.stderr)
+
+    def _shown(self, result: dict[str, Any]) -> tuple[int, ...]:
+        """The opponent's hole cards if the hand went to showdown, else ``()``."""
+        entries = result.get("showdown")
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and _int(entry.get("seat"), -1) == 1 - self.seat:
+                cards = entry.get("hole_cards")
+                if isinstance(cards, list) and len(cards) == 2:
+                    return tuple(parse_card(str(card)) for card in cards)
+        return ()
 
     def decide(self, state: GameState) -> Action:
         try:
@@ -229,6 +243,7 @@ class MicroholdemBot(Bot):
             # Blinds only go up: remember the level for hands where a short stack posts less.
             self.small_blind, self.big_blind = obs.small_blind, obs.big_blind
             self.seat = obs.seat
+            self.hand_cards = (obs.hole, obs.board)
             return to_chipzen(self.agent.act(callable_view(obs)), obs, state)
         except Exception as exc:  # one malformed state must not cost more than this decision
             print(f"microholdem: {type(exc).__name__}: {exc}; checking or folding", file=sys.stderr)

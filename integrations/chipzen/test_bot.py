@@ -359,6 +359,44 @@ def test_finished_hands_reach_the_opponent_model() -> None:
     assert bot.agent.model.rate("sb_open") > prior + 0.1
 
 
+def river_bet_called(bot: MicroholdemBot, showdown: Any) -> None:
+    """The opponent (seat 1) opens, we call, three checks each way, then it bets the river and we call."""
+    history = [
+        entry(1, "post_small_blind", 50),
+        entry(0, "post_big_blind", 100),
+        entry(1, "raise", 250),
+        entry(0, "call", 150),
+        *(entry(seat, "check", 0, phase) for phase in ("flop", "turn") for seat in (0, 1)),
+        entry(0, "check", 0, "river"),
+        entry(1, "raise", 300, "river"),
+    ]
+    bot.on_round_start({"round_number": 1, "state": {"hand_number": 1, "stacks": [10_000, 10_000]}})
+    bot.decide(
+        turn_request(
+            seat=0, dealer=1, phase="river", board=["Kh", "8d", "3c", "2s", "Jc"], hole=["Ah", "8s"], pot=800,
+            stacks=[9_750, 9_450], to_call=300, min_raise=600, max_raise=9_750, valid=["fold", "call", "raise"],
+            history=history,
+        )
+    )  # fmt: skip
+    result = {"hand_number": 1, "action_history": [*history, entry(0, "call", 300, "river")], "showdown": showdown}
+    bot.on_round_result({"result": result})
+
+
+def test_cards_shown_at_showdown_reach_the_opponent_model() -> None:
+    bot = MicroholdemBot()
+    bot.on_match_start(MATCH_START)
+    ours = {"seat": 0, "hole_cards": ["Ah", "8s"], "hand_rank": "Pair", "best_hand": []}
+    theirs = {"seat": 1, "hole_cards": ["Ks", "Kd"], "hand_rank": "Three of a Kind", "best_hand": []}
+    river_bet_called(bot, [ours, theirs])
+    assert bot.agent.model.shown["bet"] == [0.0, 0.0, 0.0, 0.0, 1.0]  # it bet the river with top set
+    river_bet_called(bot, [ours, {**theirs, "hole_cards": ["7c", "5c"], "hand_rank": "High Card"}])
+    assert bot.agent.model.shown["bet"] == [1.0, 0.0, 0.0, 0.0, 1.0]  # ... and with seven-high
+    for showdown in ([], None, [ours], [ours, {"seat": 1, "hole_cards": ["Ks"]}], [ours, {"seat": 1}], "x"):
+        river_bet_called(bot, showdown)  # won by a fold, or malformed: the hand counts, no cards do
+    assert sum(bot.agent.model.shown["bet"]) == 2.0
+    assert bot.agent.model.hands == 8
+
+
 @pytest.mark.parametrize(
     "message", [{}, {"result": None}, {"result": {"action_history": "x"}}, {"result": {"action_history": [None, 7]}}]
 )
@@ -427,3 +465,35 @@ def test_pool_opponents_differ_in_how_they_answer_a_shove() -> None:
     )  # fmt: skip
     assert make_opponent("sticky", 1).act(shoved) == CALL
     assert make_opponent("regular", 1).act(shoved) == FOLD
+
+
+def test_honest_bets_strong_hands_and_bully_mostly_weak_ones() -> None:
+    from arena import make_opponent
+
+    def bets(name: str, hole: str) -> float:
+        """How often the seat bets the flop when checked to with ``hole``."""
+        cards, board = parse_cards(hole), parse_cards("Kh 8d 3c")
+        checked_to = Observation(
+            seat=0, hole=(cards[0], cards[1]), board=(board[0], board[1], board[2]), street=1, pot=500, to_call=0,
+            min_raise_to=100, max_raise_to=9_750, can_raise=True, stacks=(9_750, 9_750), bets=(0, 0),
+            in_hand=(True, True), button=0, small_blind=50, big_blind=100, ante=0, n_in_hand=2, hand_number=1,
+            history=((0, 0, int(ActionKind.RAISE), 250), (0, 1, int(ActionKind.CALL), 150), (1, 1, 1, 0)), payouts=(),
+        )  # fmt: skip
+        seat = make_opponent(name, 1)
+        return sum(seat.act(checked_to).kind == ActionKind.RAISE for _ in range(200)) / 200
+
+    assert bets("honest", "Ks Kd") == 1.0 and bets("honest", "7c 5c") == 0.0
+    assert bets("bully", "Ks Kd") == 1.0 and 0.1 < bets("bully", "7c 5c") < 0.4
+    assert bets("honest", "Kc 9s") == 1.0 and bets("bully", "Kc 9s") < 0.6  # top pair: a bet for one only
+
+
+def test_chip_sessions_are_zero_sum_and_depend_only_on_the_seed() -> None:
+    from arena import _session_pair, make_seat, play_session
+
+    def session(seed: int) -> list[float]:
+        return play_session([make_seat("bot.py", 11, 64), make_seat("regular", 12, 64)], seed)
+
+    first = session(3)
+    assert first == session(3) and first != session(4)
+    assert first[0] + first[1] == pytest.approx(0.0)
+    assert _session_pair(("bot.py", "station", 5, 64)) == _session_pair(("bot.py", "station", 5, 64))
