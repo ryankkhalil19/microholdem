@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from microholdem import _core
 from microholdem.agent import MicroAgent
 from microholdem.archetypes import make_archetype
 from microholdem.cards import parse_cards
@@ -204,7 +205,7 @@ def test_short_reply_shoves_a_minority_of_hands_and_more_of_them_when_shorter(st
 
 def test_fold_to_shove_follows_the_price_and_then_the_opponent() -> None:
     agent = HeadsUpAgent(seed=1, samples=64)
-    lo, hi = agent._villain_slice(short_open("9d 7c", 19))
+    lo, hi = agent._villain_slice(short_open("9d 7c", 19).history, 1, 0)
     by_depth = [agent._fold_to_shove(short_open("9d 7c", n), lo, hi) for n in (6, 8, 12, 16, 20)]
     assert by_depth == sorted(by_depth)  # the better the raiser's price, the less it folds
     assert by_depth[0] == 0.0  # an open that is a third of the stack is never folded
@@ -238,41 +239,112 @@ def test_short_reply_leaves_other_spots_to_the_parent() -> None:
     assert not HeadsUpAgent._is_short_reply(obs("9d 7c", stacks=(1_950, 1_900)))  # small blind, nobody has raised
 
 
-def flop(history: tuple[tuple[int, int, int, int], ...], street: int = 1) -> Observation:
+def flop(history: tuple[tuple[int, int, int, int], ...], street: int = 1, hole: str = "Ah 8s") -> Observation:
     """We opened the button and were called; ``history`` is the postflop action so far."""
     pre = ((0, 0, RAISE, 250), (0, 1, CALL, 150))
-    board = tuple(parse_cards("Kh 8d 3c" if street == 1 else "Kh 8d 3c 2s"))
-    return obs("Ah 8s", street=street, board=board, pot=500, to_call=0, bets=(0, 0), stacks=(9_750, 9_750),
+    board = tuple(parse_cards("Kh 8d 3c 2s Jc")[: 2 + street])
+    return obs(hole, street=street, board=board, pot=500, to_call=0, bets=(0, 0), stacks=(9_750, 9_750),
                min_raise_to=100, history=(*pre, *history))  # fmt: skip
 
 
-def test_standing_rises_with_equity_and_falls_with_each_bet() -> None:
+def equity_against_reading(agent: HeadsUpAgent, o: Observation) -> float:
+    """Our equity against the opponent's range as the agent reads it."""
+    read = agent._reading(o.history, o.seat, o.button, o.hole, o.board)
+    live = read.weights > 0.0
+    villain = _core.CompiledRange(agent._hands[read.hands[live]], read.weights[live])
+    return float(_core.equity_vs_compiled(list(o.hole), list(o.board), [villain], 20_000, 7))
+
+
+def test_reading_starts_from_the_preflop_range_less_the_cards_in_view() -> None:
     agent = HeadsUpAgent(seed=1, samples=64)
-    unbet = flop(())
-    assert agent._standing(unbet, 0.3) < agent._standing(unbet, 0.6) < agent._standing(unbet, 0.9)
-    assert agent._standing(unbet, 0.6) == pytest.approx(0.6)
-    one = flop(((1, 1, RAISE, 250),))
-    two = flop(((1, 1, RAISE, 250), (1, 0, CALL, 250), (2, 1, RAISE, 600)), street=2)
-    assert agent._standing(two, 0.6) < agent._standing(one, 0.6) < 0.6
-    assert agent._standing(one, 0.97) > 0.9  # a near-nut hand stays ahead of a betting range
+    o = flop(())
+    read = agent._reading(o.history, o.seat, o.button, o.hole, o.board)
+    seen = {*o.hole, *o.board}
+    assert all(not seen & {int(a), int(b)} for a, b in agent._hands[read.hands])
+    assert (read.weights > 0.0).all() and read.marks == []
+    lo, hi = agent._villain_slice(o.history, o.seat, o.button)
+    weights = agent._slice(lo, hi)[1]
+    assert set(agent._hand_class[read.hands].tolist()) <= set(weights.nonzero()[0].tolist())
 
 
-def test_standing_reads_a_frequent_bettor_as_weaker() -> None:
+def test_each_bet_makes_the_range_stronger() -> None:
+    agent = HeadsUpAgent(seed=1, samples=64)
+    unbet = equity_against_reading(agent, flop(()))
+    one = equity_against_reading(agent, flop(((1, 1, RAISE, 250),)))
+    turn = flop(((1, 1, RAISE, 250), (1, 0, CALL, 250)), street=2)
+    two = equity_against_reading(agent, flop(((1, 1, RAISE, 250), (1, 0, CALL, 250), (2, 1, RAISE, 600)), street=2))
+    assert two < one < unbet
+    assert two < equity_against_reading(agent, turn)
+    nuts = flop(((1, 1, RAISE, 250),), hole="Ks Kd")
+    assert equity_against_reading(agent, nuts) > 0.9  # top set stays ahead of a betting range
+
+
+def test_reading_takes_a_frequent_bettor_as_weaker() -> None:
     bet = flop(((1, 1, RAISE, 250),))
     pre = [(0, 0, RAISE, 250), (0, 1, CALL, 150)]
     maniac, rock = HeadsUpAgent(seed=1, samples=64), HeadsUpAgent(seed=1, samples=64)
     for _ in range(40):
         maniac.observe_hand([*pre, (1, 1, RAISE, 250), (1, 0, FOLD, 0)], 0, 0, 100, 10_000)
         rock.observe_hand([*pre, (1, 1, CHECK, 0), (1, 0, CHECK, 0)], 0, 0, 100, 10_000)
-    assert maniac._standing(bet, 0.55) > rock._standing(bet, 0.55) + 0.2
+    assert equity_against_reading(maniac, bet) > equity_against_reading(rock, bet) + 0.15
 
 
-def test_a_check_and_a_call_move_the_standing_the_right_way() -> None:
+def test_a_check_and_a_call_move_the_reading_the_right_way() -> None:
     agent = HeadsUpAgent(seed=1, samples=64)
-    checked = flop(((1, 1, CHECK, 0),))
-    assert agent._standing(checked, 0.6) > 0.6  # a check takes strong hands out of the range
-    called = flop(((1, 1, CHECK, 0), (1, 0, RAISE, 250), (1, 1, CALL, 250)), street=2)
-    assert agent._standing(called, 0.6) < agent._standing(checked, 0.6)  # the weakest hands folded
+    unbet = equity_against_reading(agent, flop(()))
+    checked = equity_against_reading(agent, flop(((1, 1, CHECK, 0),)))
+    assert checked > unbet  # a check takes strong hands out of the range
+    line = ((1, 1, CHECK, 0), (1, 0, RAISE, 250), (1, 1, CALL, 250))
+    assert equity_against_reading(agent, flop(line, street=2)) < checked  # the weakest hands folded
+
+
+def test_a_draw_keeps_its_chance_to_improve_against_a_bet() -> None:
+    # Seven-high beats almost nothing a rare bettor bets; with a flush draw it still wins a third of the time.
+    agent = HeadsUpAgent(seed=1, samples=64)
+    pre = [(0, 0, RAISE, 250), (0, 1, CALL, 150)]
+    for _ in range(30):
+        agent.observe_hand([*pre, (1, 1, CHECK, 0), (1, 0, CHECK, 0)], 0, 0, 100, 10_000)
+    board = tuple(parse_cards("Kh 9h 3c"))
+    draw = replace(flop(((1, 1, RAISE, 500),), hole="7h 6h"), board=board, to_call=500)
+    air = replace(flop(((1, 1, RAISE, 500),), hole="7s 6d"), board=board, to_call=500)  # the same ranks, no draw
+    assert equity_against_reading(agent, air) < 0.15
+    assert equity_against_reading(agent, draw) > 0.30
+
+
+def test_content_starts_as_assumed_and_follows_what_is_shown() -> None:
+    m = OpponentModel()
+    assumed = [0.05, 0.05, 0.05, 0.15, 0.70]
+    assert m.content("bet", assumed) == pytest.approx([1.0] * 5)
+    for _ in range(18):
+        m.observe_shown("bet", 0.1)
+    factor = m.content("bet", assumed)
+    assert factor[0] > 5.0 and factor[4] < 0.5
+    assert sum(f * a for f, a in zip(factor, assumed, strict=True)) == pytest.approx(1.0)  # still shares of its bets
+    assert m.content("raise", assumed) == pytest.approx([1.0] * 5)
+
+
+def test_shown_bluffs_weaken_a_bet_and_shown_strong_hands_strengthen_it() -> None:
+    bet = flop(((1, 1, RAISE, 250),))
+    fresh, bluffer, honest = (HeadsUpAgent(seed=1, samples=64) for _ in range(3))
+    for _ in range(12):
+        bluffer.model.observe_shown("bet", 0.15)
+        honest.model.observe_shown("bet", 0.95)
+    assert equity_against_reading(bluffer, bet) > equity_against_reading(fresh, bet) + 0.10
+    assert equity_against_reading(honest, bet) < equity_against_reading(fresh, bet)
+
+
+def test_a_showdown_counts_each_bet_by_the_strength_of_the_hand_that_made_it() -> None:
+    pre = [(0, 0, RAISE, 250), (0, 1, CALL, 150)]
+    bets = [(1, 1, RAISE, 250), (1, 0, CALL, 250), (2, 1, RAISE, 600), (2, 0, CALL, 600)]
+    line = [*pre, *bets, (3, 1, CHECK, 0), (3, 0, CHECK, 0)]
+    hole, board = parse_cards("Ah 8s"), parse_cards("Kh 8d 3c 2s Jc")
+    agent = HeadsUpAgent(seed=1, samples=64)
+    agent.observe_hand(line, 0, 0, 100, 10_000, hole, board, parse_cards("3s 3d"))  # bet a set twice
+    assert agent.model.shown["bet"] == [0.0, 0.0, 0.0, 0.0, 2.0]
+    agent.observe_hand(line, 0, 0, 100, 10_000, hole, board, parse_cards("7c 5c"))  # bet seven-high twice
+    assert agent.model.shown["bet"][0] == 2.0
+    agent.observe_hand(line, 0, 0, 100, 10_000)  # no cards shown: frequencies only
+    assert sum(agent.model.shown["bet"]) == 4.0 and agent.model.hands == 3
 
 
 @pytest.mark.parametrize("opponent", ["oracle", "blitz", "sponge", "jammer"])

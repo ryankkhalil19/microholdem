@@ -1,7 +1,7 @@
 """Heads-up agent with a per-opponent frequency model.
 
 :class:`HeadsUpAgent` plays two-seat tables; with more seats it defers to :class:`MicroAgent`.
-It keeps the parent's preflop opening and defending ranges and changes four things.
+It keeps the parent's preflop opening and defending ranges and changes five things.
 
 Pot odds use only the chips that can be won.
     :func:`callable_view` caps every bet at what the acting seat can match, so a shove that
@@ -18,23 +18,29 @@ A short stack answers an open by expected value.
     shoving are each valued in chips, the shove against how often this opponent has folded its
     open to one, and the best of the three is played (:meth:`HeadsUpAgent._facing_open_short`).
 
-Postflop decisions condition on the opponent's own frequencies.
-    The opponent's range is laid out by strength and reweighted by what it did this hand: a bet
-    from a seat that bets a fraction ``a`` of the time keeps the top of its range and scales the
-    rest down, a check does the reverse, and a call of our bet drops the hands that would have
-    folded. The agent's equity against the whole range becomes a win probability against that
-    reweighted range, compared with the pot odds. It therefore calls a frequent bettor lightly
-    and a rare bettor tightly, and sizes its own value bets and bluffs by how often the
-    opponent has folded.
+Postflop decisions read the opponent's range hand by hand.
+    Every hand the opponent can hold is weighted by what it did this hand: a bet from a seat that
+    bets a fraction ``a`` of the time keeps the best of its range and scales the rest down, a
+    check does the reverse, and a call of our bet drops the hands that would have folded. The
+    agent's equity against those weighted hands, with the cards still to come, is compared with
+    the pot odds. It therefore calls a frequent bettor lightly and a rare bettor tightly, a draw
+    keeps its chance to improve, and its own value bets and bluffs follow how often the opponent
+    has folded.
 
-Every decision is a few table reads, a 50-cell loop and at most one C++ equity call.
+What a bet contains is learned from showdowns.
+    Each bet or raise whose hand is later shown is counted by where that hand stood in the range
+    (:meth:`OpponentModel.observe_shown`), and the shares move the assumed content of the next
+    bet: towards bluffs for a seat that shows them, towards strong hands for one that does not.
+
+A postflop decision costs one evaluation of the opponent's hands per street it acted on and one
+C++ equity call: about a millisecond at 600 samples.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import numpy.typing as npt
@@ -62,7 +68,11 @@ SHOVE_GAME_ROUNDS = 40  # rounds of fictitious play in HeadsUpAgent._shove_game
 COMMITTED = 0.33  # a seat with this share of its stack in the pot does not fold; a call this large is a shove or a fold
 MARGIN_FLOP = 0.04  # extra equity needed to call a flop bet: more bets may follow
 MARGIN_TURN = 0.02
-_BINS = 50  # resolution of the range-strength grid in HeadsUpAgent._standing
+MARGIN_STACK = 0.02  # extra equity needed to call half the stack or more
+SHAPE_BINS = 5  # the content of a bet or a raise is learned per fifth of the range
+SHAPE_WEIGHT = 12.0  # weight of the assumed content, in bets or raises whose hand was shown
+SLOWPLAY = 0.3  # a hand strong enough to bet every time is still checked this often
+VALUE_RAISE = 0.75  # raise a postflop bet at this equity against the range that made it
 
 
 def callable_view(obs: Observation) -> Observation:
@@ -104,12 +114,31 @@ class OpponentModel:
     def __init__(self) -> None:
         self.hits: dict[str, float] = dict.fromkeys(self.PRIORS, 0.0)
         self.seen: dict[str, float] = dict.fromkeys(self.PRIORS, 0.0)
+        # Postflop bets and raises whose hand was shown, counted by where the hand stood in the range.
+        self.shown: dict[str, list[float]] = {"bet": [0.0] * SHAPE_BINS, "raise": [0.0] * SHAPE_BINS}
         self.hands = 0
 
     def rate(self, stat: str, mean: float | None = None) -> float:
         """The smoothed frequency; ``mean`` replaces the prior mean when the spot implies a better one."""
         prior, weight = self.PRIORS[stat]
         return ((prior if mean is None else mean) * weight + self.hits[stat]) / (weight + self.seen[stat])
+
+    def observe_shown(self, kind: str, standing: float) -> None:
+        """Count a ``kind`` ("bet" or "raise") made with a hand that beat ``standing`` of the range it came from."""
+        self.shown[kind][min(SHAPE_BINS - 1, max(0, int(standing * SHAPE_BINS)))] += 1.0
+
+    def content(self, kind: str, assumed: Sequence[float]) -> list[float]:
+        """Per fifth of the range, weakest first: the share of this opponent's bets found there over the assumed share.
+
+        ``assumed`` is the share of its bets (or raises) expected from each fifth before any hand is
+        shown. Shown hands move each share as counts move a frequency, so every factor starts at 1.
+        """
+        counts = self.shown[kind]
+        n = sum(counts)
+        return [
+            (SHAPE_WEIGHT * a + c) / ((SHAPE_WEIGHT + n) * a) if a > 0.0 else 1.0
+            for a, c in zip(assumed, counts, strict=True)
+        ]
 
     def _count(self, stat: str, hit: bool) -> None:
         self.seen[stat] += 1.0
@@ -155,6 +184,15 @@ class OpponentModel:
                     bettor = seat
 
 
+@dataclass(slots=True)
+class Reading:
+    """The opponent's possible hands after its actions this hand; see :meth:`HeadsUpAgent._reading`."""
+
+    hands: npt.NDArray[np.intp]  # rows of ``HeadsUpAgent._hands``
+    weights: npt.NDArray[np.float64]  # how likely each is, up to a constant
+    marks: list[tuple[str, float]]  # for a shown hand: each bet or raise it made and where the hand stood
+
+
 class HeadsUpAgent(MicroAgent):
     """See the module docstring. Feed finished hands to :meth:`observe_hand` to adapt to the opponent."""
 
@@ -168,12 +206,34 @@ class HeadsUpAgent(MicroAgent):
         self._cond_equity: npt.NDArray[np.float64] = self.tb.cond * self.tb.class_equity  # row: hero class
         self._shove_folds: dict[tuple[int, ...], float] = {}
         self._bands: dict[tuple[int, int], npt.NDArray[np.float64]] = {}
+        pairs = [(c, pair) for c in range(len(self.tb.rank_hu)) for pair in class_combos(c)]
+        self._hands = np.asarray([pair for _c, pair in pairs], dtype=np.int32)  # every two-card hand
+        self._hand_class = np.asarray([c for c, _pair in pairs], dtype=np.intp)
+        self._hand_row = {(min(pair), max(pair)): row for row, (_c, pair) in enumerate(pairs)}
+        self._holds = np.zeros((52, len(pairs)), dtype=bool)  # row: card; column: hand containing it
+        for column in (0, 1):
+            self._holds[self._hands[:, column], np.arange(len(pairs))] = True
 
     def new_opponent(self) -> None:
         """Forget what was learned; call when the seat across the table changes."""
         self.model = OpponentModel()
 
-    def observe_hand(self, history: History, hero: int, button: int, big_blind: int, effective_stack: int) -> None:
+    def observe_hand(
+        self,
+        history: History,
+        hero: int,
+        button: int,
+        big_blind: int,
+        effective_stack: int,
+        hole: Sequence[int] = (),
+        board: Sequence[int] = (),
+        shown: Sequence[int] = (),
+    ) -> None:
+        """Count a finished hand. With our ``hole`` cards, the ``board`` and the opponent's ``shown`` cards,
+        each bet and raise the opponent made after the flop is also counted by how strong its hand was."""
+        if len(hole) == 2 and len(shown) == 2 and len(board) >= 3:
+            for kind, standing in self._reading(history, hero, button, hole, board, shown).marks:
+                self.model.observe_shown(kind, standing)
         self.model.observe_hand(history, hero, button, big_blind, effective_stack)
 
     # ------------------------------------------------------------------
@@ -192,16 +252,15 @@ class HeadsUpAgent(MicroAgent):
             self._slices[(a, b)] = found
         return found
 
-    def _villain_slice(self, obs: Observation) -> tuple[float, float]:
+    def _villain_slice(self, history: History, hero: int, button: int) -> tuple[float, float]:
         """The opponent's preflop range as a slice of the ranking, from its line this hand."""
         m = self.model
-        hero = obs.seat
         villain = 1 - hero
-        pre = [(seat, kind) for st, seat, kind, _a in obs.history if st == 0]
+        pre = [(seat, kind) for st, seat, kind, _a in history if st == 0]
         villain_raises = sum(1 for seat, kind in pre if seat == villain and kind == _RAISE)
         hero_raises = sum(1 for seat, kind in pre if seat == hero and kind == _RAISE)
         open_rate = min(1.0, max(0.15, m.rate("sb_open")))
-        if obs.button == villain:  # the opponent was the small blind
+        if button == villain:  # the opponent was the small blind
             if pre and pre[0] == (villain, _CALL):  # it limped
                 if villain_raises:
                     return 0.0, 0.08
@@ -381,7 +440,7 @@ class HeadsUpAgent(MicroAgent):
         and calls with the best of the range.
         """
         cls = class_index(obs.hole[0], obs.hole[1])
-        lo, hi = self._villain_slice(obs)
+        lo, hi = self._villain_slice(obs.history, obs.seat, obs.button)
         fold = self._fold_to_shove(obs, lo, hi)
         shove, call = self._reply_values(obs, self._band(lo, hi), self._band(lo, lo + (hi - lo) * (1.0 - fold)))
         if obs.can_raise and shove[cls] > max(call[cls], 0.0):
@@ -391,64 +450,114 @@ class HeadsUpAgent(MicroAgent):
     # ------------------------------------------------------------------
     # postflop
     # ------------------------------------------------------------------
-    def _standing(self, obs: Observation, eq: float) -> float:
-        """Win probability against the opponent's range as reweighted by this hand's postflop actions.
+    def _odds(self, kind: str, standing: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """How often the opponent bets (``kind`` "bet") or raises a bet ("raise") with a hand at each ``standing``.
 
-        The opponent's range is laid out by strength on a grid, weakest first; ``eq``, the equity
-        against the whole range, is read as the share of it the agent beats. A seat that bets with
-        frequency ``a`` is modelled as betting the top ``a * (1 - bluffs)`` of its range for value
-        every time and anything weaker as a bluff with a fixed probability, so each bet scales the
-        weaker part down and repeated bets compound. A check scales the value part down instead,
-        and a call of our bet removes the weakest hands, which would have folded.
+        ``standing`` is the share of its range a hand beats. Until hands are shown, a seat that bets
+        with frequency ``a`` is taken to bet the top ``a * (1 - bluffs)`` of its range every time and
+        anything weaker with one fixed probability. Each fifth of the range is then scaled by
+        :meth:`OpponentModel.content`: up where this opponent's shown bets have come from, down
+        where they have not.
         """
         m = self.model
-        hero = obs.seat
-        bet_rate = min(0.95, max(0.08, m.rate("bet")))
-        raise_rate = min(0.6, max(0.03, m.rate("raise")))
-        fold_rate = min(0.9, max(0.05, m.rate("fold_to_bet")))
-        bet_value = bet_rate * (1.0 - min(0.5, 0.10 + 0.45 * bet_rate))
-        bet_bluff = (bet_rate - bet_value) / (1.0 - bet_value)
-        raise_value = raise_rate * 0.8
-        raise_bluff = (raise_rate - raise_value) / (1.0 - raise_value)
-        w = [1.0] * _BINS
-        street = 0
+        if kind == "bet":
+            rate = min(0.95, max(0.08, m.rate("bet")))
+            value = rate * (1.0 - min(0.5, 0.10 + 0.45 * rate))
+        else:
+            rate = min(0.6, max(0.03, m.rate("raise")))
+            value = rate * 0.8
+        bluff = (rate - value) / (1.0 - value)
+        edges = np.linspace(0.0, 1.0, SHAPE_BINS + 1)
+        always = np.clip(edges[1:] - np.maximum(edges[:-1], 1.0 - value), 0.0, None)  # part of each fifth always bet
+        assumed = (always + (1.0 / SHAPE_BINS - always) * bluff) / rate
+        factor = np.asarray(m.content(kind, assumed.tolist()))
+        fifth = np.minimum(SHAPE_BINS - 1, (standing * SHAPE_BINS).astype(np.intp))
+        odds: npt.NDArray[np.float64] = np.minimum(1.0, np.where(standing >= 1.0 - value, 1.0, bluff) * factor[fifth])
+        return odds
+
+    @staticmethod
+    def _standings(weights: npt.NDArray[np.float64], groups: npt.NDArray[np.intp]) -> npt.NDArray[np.float64]:
+        """The share of the weighted range each hand beats; ``groups`` numbers the hands' ranks, weakest first."""
+        mass = np.bincount(groups, weights=weights)
+        total = float(mass.sum())
+        if total <= 0.0:
+            return np.full(len(weights), 0.5)
+        return ((np.cumsum(mass) - 0.5 * mass) / total)[groups]
+
+    def _reading(
+        self,
+        history: History,
+        hero: int,
+        button: int,
+        hole: Sequence[int],
+        board: Sequence[int],
+        shown: Sequence[int] = (),
+    ) -> Reading:
+        """The opponent's possible hands, weighted by what it did this hand.
+
+        It starts with its preflop range (:meth:`_villain_slice`) less the cards in view. At each of
+        its actions after the flop the hands are ordered by what they make on that street's board,
+        and each is scaled by how often a hand standing there takes the action: a bet or raise by
+        :meth:`_odds`, a check by the chance it does not bet, and a call of our bet drops the
+        weakest hands, which would have folded. A draw therefore sits among the weak hands, where a
+        bet with it is a bluff, and keeps its chance to improve when equity is taken against the
+        result. ``shown`` is the opponent's hand when it was revealed: every bet and raise it made
+        is then marked with where that hand stood.
+        """
+        lo, hi = self._villain_slice(history, hero, button)
+        weights = self._slice(lo, hi)[1][self._hand_class]
+        free = ~self._holds[[*hole, *board]].any(axis=0)
+        hands = np.flatnonzero(free if shown else free & (weights > 0.0))
+        w = weights[hands]
+        if not w.any():
+            hands = np.flatnonzero(free)
+            w = np.ones(len(hands))
+        track = -1
+        if shown:
+            row = self._hand_row[(min(shown), max(shown))]
+            at = int(np.searchsorted(hands, row))
+            track = at if at < len(hands) and hands[at] == row else -1
+        fold_rate = min(0.9, max(0.05, self.model.rate("fold_to_bet")))
+        marks: list[tuple[str, float]] = []
+        groups: npt.NDArray[np.intp] = np.zeros(0, dtype=np.intp)
+        street = ranked = 0
         bettor = -1
-        for st, seat, kind, _a in obs.history:
+        for st, seat, kind, _a in history:
             if st == 0:
                 continue
             if st != street:
+                if len(board) < 2 + st:
+                    break
                 street, bettor = st, -1
             if seat != hero:
+                if ranked != street:
+                    cards = np.empty((len(hands), 4 + street), dtype=np.int32)
+                    cards[:, :2] = self._hands[hands]
+                    cards[:, 2:] = board[: 2 + street]
+                    groups = np.unique(_core.evaluate_batch(cards), return_inverse=True)[1]
+                    ranked = street
+                standing = self._standings(w, groups)
+                scaled = w
                 if kind == _RAISE:
-                    value, bluff = (raise_value, raise_bluff) if bettor == hero else (bet_value, bet_bluff)
-                    for i in range(int((1.0 - value) * _BINS)):
-                        w[i] *= bluff
+                    which = "raise" if bettor == hero else "bet"
+                    if track >= 0:
+                        marks.append((which, float(standing[track])))
+                    scaled = w * self._odds(which, standing)
                 elif kind == _CALL and bettor == hero:
-                    drop = fold_rate * sum(w)
-                    for i in range(_BINS):
-                        if w[i] >= drop:
-                            w[i] -= drop
-                            break
-                        drop -= w[i]
-                        w[i] = 0.0
+                    scaled = w * (standing >= fold_rate)
                 elif bettor == -1:  # checked with the option to bet
-                    cut = int((1.0 - bet_value) * _BINS)
-                    for i in range(_BINS):
-                        w[i] *= (1.0 - bet_bluff) if i < cut else 0.3
+                    scaled = w * np.maximum(SLOWPLAY, 1.0 - self._odds("bet", standing))
+                if scaled.any():
+                    w = scaled
             if kind == _RAISE:
                 bettor = seat
-        total = sum(w)
-        if total <= 0.0:
-            return eq
-        x = min(1.0, max(0.0, eq)) * _BINS
-        whole = int(x)
-        below = sum(w[:whole]) + (w[whole] * (x - whole) if whole < _BINS else 0.0)
-        return below / total
+        return Reading(hands, w, marks)
 
     def _postflop_hu(self, obs: Observation, t0: int) -> Action:
-        lo, hi = self._villain_slice(obs)
-        eq = self._equity(obs, t0, [self._slice(lo, hi)[0]])
-        q = self._standing(obs, eq)
+        read = self._reading(obs.history, obs.seat, obs.button, obs.hole, obs.board)
+        live = read.weights > 0.0
+        villain = _core.CompiledRange(self._hands[read.hands[live]], read.weights[live])
+        q = self._equity(obs, t0, [villain])  # equity against the opponent's range as it now stands
         fold_rate = self.model.rate("fold_to_bet")
         river = obs.street == Street.RIVER
 
@@ -468,10 +577,10 @@ class HeadsUpAgent(MicroAgent):
             return CHECK
 
         need = obs.to_call / (obs.pot + obs.to_call)
-        if obs.can_raise and q >= 0.80 and eq >= 0.85:
+        if obs.can_raise and q >= VALUE_RAISE:
             action = self._raise_multiple(obs, 2.7)
             return self._shove(obs) if action.amount - obs.bet >= 0.45 * obs.stack else action
         margin = 0.0 if river else (MARGIN_FLOP if obs.street == Street.FLOP else MARGIN_TURN)
         if obs.to_call >= 0.5 * obs.stack:
-            margin += 0.02
+            margin += MARGIN_STACK
         return CALL if q >= need + margin else FOLD
